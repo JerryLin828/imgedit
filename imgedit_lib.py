@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import shutil
 import subprocess
 import tarfile
 from collections import defaultdict
@@ -22,6 +24,8 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, S
 
 import pyarrow.parquet as pq
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # --- Official ImgEdit parquet field names (HF dataset Parquet/*.parquet) ---
 COL_INPUT_IMAGES = "input_images"
@@ -51,6 +55,11 @@ EMBED_ORIG_CANDIDATES: List[str] = ["source_img", "original_img", "input_img"]
 EMBED_EDIT_CANDIDATES: List[str] = ["target_img", "edited_img", "output_img"]
 
 TEXT_CANDIDATES: List[str] = [COL_PROMPT, "instruction", "caption", "text", "edit_instruction"]
+
+# Parquet path strings often use "results_compose*" (e.g. results_compose_part0, results_compose_part6_fix;
+# stage1_explore logs these as roots_missing_in_hub_filenames for hybrid_part*.parquet) while Hub ships
+# results_hybrid* archives/trees. apply_rel_substitutions replaces the first occurrence of OLD in each path.
+HYBRID_COMPOSE_SUBST: Tuple[str, str] = ("results_compose", "results_hybrid")
 
 
 def apply_rel_substitutions(rel: str, rules: Sequence[Tuple[str, str]]) -> str:
@@ -369,6 +378,59 @@ def sanity_check_tar_triplet(
             txt_bytes.decode("utf-8")
 
     return dict(counts)
+
+
+def warn_bucket_zone(bucket: str, expected_zone: str) -> None:
+    """
+    If expected_zone is set, warn when it does not appear in the bucket URI.
+    Same guardrail as deepfusion/dataset/upload_magicbrush_webdataset.py.
+    """
+    b = (bucket or "").strip()
+    ez = (expected_zone or "").strip()
+    if not ez or not b:
+        return
+    if ez not in b:
+        logger.warning(
+            "Expected zone marker %r not found in bucket %r. "
+            "Match your VM region/zone to the bucket to avoid slow uploads and egress.",
+            ez,
+            b,
+        )
+
+
+def dir_size_human(path: Path) -> str:
+    ret = subprocess.run(
+        ["du", "-sh", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if ret.returncode != 0 or not ret.stdout.strip():
+        return "N/A"
+    return ret.stdout.strip().split()[0]
+
+
+def log_paths_disk_usage(label: str, paths: Sequence[Path]) -> None:
+    """Log mount space and `du -sh` for paths (deepfusion MagicBrush uploader style)."""
+    plist = [p for p in paths if p is not None]
+    if not plist:
+        return
+    try:
+        usage = shutil.disk_usage(plist[0])
+        gb = 1024**3
+        msg = (
+            f"{label}: free={usage.free / gb:.2f}GiB used={usage.used / gb:.2f}GiB "
+            f"total={usage.total / gb:.2f}GiB"
+        )
+    except OSError as exc:
+        logger.info("%s: disk usage unavailable (%s)", label, exc)
+        return
+    parts = [msg]
+    for p in plist:
+        if p.exists():
+            parts.append(f"{p}={dir_size_human(p)}")
+        else:
+            parts.append(f"{p}=missing")
+    logger.info(" | ".join(parts))
 
 
 def gcs_object_exists(gcs_uri: str) -> bool:

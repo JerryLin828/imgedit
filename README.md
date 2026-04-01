@@ -1,8 +1,8 @@
 # Preparing ImgEdit on GCS Bucket
 
-Two-stage conversion from Hugging Face dataset `sysuyy/ImgEdit` into WebDataset shards. **Only rows where both images exist on disk and decode cleanly are kept** (correctness over raw row count).
+Two-stage conversion from Hugging Face dataset `sysuyy/ImgEdit` into WebDataset shards. **Only rows where both images exist on disk and decode cleanly are kept** (correctness over raw row count). Design mirrors `deepfusion/dataset/docs/magicbrush.md` and `upload_magicbrush_webdataset.py`: **`gcloud storage cp -n`**, `/dev/shm` scratch, optional **zone check** on the bucket path, and **disk usage logging** during chunk processing.
 
-- **Source format:** `Parquet/*.parquet` (lists of paths + `prompt`; multiturn uses a `data` column). Binary blobs live under `Singleturn/` and `Multiturn/` as `results_*.tar.split.*` chunks; you must **concatenate and extract** them so parquet paths resolve.
+- **Source format:** `Parquet/*.parquet` (lists of paths + `prompt`; multiturn uses a `data` column). Binary blobs live under `Singleturn/` and `Multiturn/` as `results_*.tar.split.*` and sometimes whole `.tar` archives; **`stage2_chunk.py`** merges splits, extracts standalone tars, then audits path resolution.
 - **Processing strategy:**
   - **Stage 1:** small download (parquets + README + score JSON) and a JSON report (strict pair counts, coarse Hub prefix checks).
   - **Stage 2:** walk the full local tree, stream parquets, pack **validated** samples into `.tar` shards, upload with **`gcloud storage cp -n`**.
@@ -26,6 +26,7 @@ Optional: set `HF_TOKEN` if your environment needs authenticated Hugging Face ac
 
 - `imgedit/stage1_explore.py` — light snapshot + `exploration_report.json`
 - `imgedit/stage2_build_webdataset.py` — WebDataset build + optional GCS upload
+- `imgedit/stage2_chunk.py` — HF slice download + build + optional chunk dir delete
 - `imgedit/imgedit_lib.py` — path resolution, schema detection, tar/GCS helpers
 
 ### What it does
@@ -42,7 +43,7 @@ Optional: set `HF_TOKEN` if your environment needs authenticated Hugging Face ac
 
 1. Expects `--dataset-root` to contain `Parquet/` and **extracted** image files reachable from those paths (or pass `--full-snapshot-download` once; very large).
 2. Reads rows in batches; for each strict pair, resolves both files under the dataset root (`Singleturn/`, `Multiturn/`, etc.), re-encodes as JPEG, drops anything missing or corrupt.
-3. Packs samples into `shard-XXXXX.tar` (width 5 by default).
+3. Packs samples into `shard-XXXXX.tar` (width 5 by default), or `{shard-prefix}-shard-XXXXX.tar` when `--shard-prefix` is set (for chunked runs).
 4. Runs sanity checks on each tar:
    - required suffixes per key (`jpg`, `jpg2`, `txt`)
    - counts match (`jpg == jpg2 == txt == samples_in_shard`)
@@ -69,13 +70,14 @@ python stage1_explore.py --no-download --local-dir /dev/shm/imgedit_stage1 \
   --log-file /kmh-nfs-ssd-us-mount/code/<you>/imgedit/stage1_hub_only.log
 ```
 
-**Stage 2** after full download + extract (match `<zone>` to your VM; same pattern as other `deepfusion/dataset` buckets):
+**Stage 2** after full download + extract (match `<zone>` to your VM; canonical prefix in code is `DEFAULT_BUCKET` in `stage2_build_webdataset.py`, same `gs://kmh-gcp-…/data/<name>` layout as MagicBrush):
 
 ```bash
 python stage2_build_webdataset.py \
   --dataset-root /path/to/imgedit_snapshot \
   --work-dir /dev/shm/imgedit_wds \
   --bucket gs://kmh-gcp-<zone>/data/imgedit \
+  --expected-zone <zone> \
   --skip-existing
 ```
 
@@ -91,6 +93,50 @@ python stage2_build_webdataset.py \
 ```
 
 Run long jobs in `tmux`/`screen`.
+
+## Chunk workflow (one parquet + tars → validate → upload → delete)
+
+Full ImgEdit is multi‑terabyte on Hugging Face. With **limited local disk**, run **one chunk at a time**: download one parquet (via `--parquet`) plus the `Singleturn` / `Multiturn` globs for that slice, **merge `*.tar.split.*` in order and extract** inside `--chunk-dir`, **audit** that strict parquet paths resolve on disk, build with a **unique shard prefix** (default: parquet stem), upload, then **`--delete-chunk-after`** to remove the chunk.
+
+**Single command** (example — adjust `--allow-pattern` to match [the repo](https://huggingface.co/datasets/sysuyy/ImgEdit/tree/main)):
+
+```bash
+cd imgedit
+python stage2_chunk.py \
+  --chunk-dir /dev/shm/imgedit_chunk_remove_p0 \
+  --parquet Parquet/remove_part0.parquet \
+  --allow-pattern "Singleturn/results_remove*.tar.split.*" \
+  --work-dir /dev/shm/imgedit_wds \
+  --bucket gs://kmh-gcp-<zone>/data/imgedit \
+  --expected-zone <zone> \
+  --skip-existing \
+  --delete-chunk-after
+```
+
+This writes `audit_<parquet-stem>.json` (includes `subst_rules_applied`) before build; the run **fails** if `resolve_rate` on strict pairs is below `--min-resolve-rate` (default `1.0`), or if **no samples** pass path + decode + JPEG checks (`total_kept == 0`), so bad slices are not treated as success. Lower the audit bar only with `--min-resolve-rate`; override the sample check only with `--allow-empty-output`.
+
+**Hybrid / compose naming:** `hybrid_part*.parquet` rows use path roots like `results_compose_part0` / `results_compose_part6_fix` while Hub file names use **`results_hybrid`**. `stage2_chunk.py` **turns on** `results_compose→results_hybrid` automatically for stems `hybrid_part*` (override with **`--no-auto-hybrid-compose`**). You still must pass **`--allow-pattern`** globs that match the **`results_hybrid*`** tar/split names on Hugging Face.
+
+With `--delete-chunk-after`, the audit file is **copied** next to the build report before the chunk directory is removed.
+
+### Reading `stage1_explore.log` for chunk runs
+
+Typical lines from a full Stage 1 pass and how Stage 2 treats them:
+
+| Log pattern | Meaning | `stage2_chunk.py` note |
+|-------------|---------|-------------------------|
+| `action_*.parquet` + *basename-only paths* | Paths are filenames only; Hub file list check is N/A | Resolver looks under `Singleturn/` / `Multiturn/` / dataset root; ensure your tars extract so those basenames exist there. |
+| `hybrid_part*.parquet` + `roots not in hub names: ['results_compose_…']` | Parquet uses **compose** path prefix; Hub ships **hybrid** blobs | Compose→hybrid subst **auto** for `hybrid_part*` stems; download `results_hybrid*` patterns. |
+| `reference_replace_*.parquet` + `strict_pairs=0` | Rows have multiple reference inputs (not one-in/one-out) | Current pipeline **skips** all rows; expect audit failure unless `--allow-zero-strict-pairs`, then **zero** samples unless you change pairing rules. |
+| `reference_extract_*.parquet` + missing `results_extract_ref_*` in hub names | String mismatch vs published tar/tree names | Inspect Hub tree; may need **`--subst OLD:NEW`** after you confirm the real prefix. |
+| `style_transfer_part0` + long root like `results_style_transfer_part0_cap36472` | Coarse stage1 substring check | Compare to actual extracted paths; add **`--subst`** if parquet strings don’t match on-disk dirs. |
+| `strict_pairs` **>** `rows` (e.g. content / multiturn-style) | Several strict pairs emitted per row | Normal; Stage 2 iterates every pair. |
+
+**Optional:** `--download-only` then re-run with `--skip-download` if you want a two-step handoff. **`--no-extract`** if you already merged/extracted manually. **`--skip-audit`** only for emergencies.
+
+Shards on GCS look like `remove_part0-shard-00000.tar`, so later chunks **do not overwrite** earlier ones. Override with **`--shard-prefix`** when needed.
+
+You can also drive **`stage2_build_webdataset.py`** alone with `--dataset-root` pointing at a partial tree and **`--shard-prefix`** + **`--parquets-only`** if you manage downloads yourself.
 
 ## Key Args
 
@@ -117,8 +163,40 @@ Run long jobs in `tmux`/`screen`.
 - `--subst OLD:NEW` — optional verified path substring replace; repeatable; use only after checking real files on disk.
 - `--max-shards` — stop after N shards (debug).
 - `--report-path` — override `build_report.json` location.
+- `--shard-prefix` — prefix for shard filenames (avoids GCS collisions between chunk runs).
+- `--parquets-only` — comma-separated parquet basenames to process.
+- `--expected-zone` — if set, log a warning when this substring is missing from `--bucket` (catches wrong-region buckets).
 
-There is **no** MagicBrush-only flags here (`--cleanup-corner`, `--dry-run`, per-parquet shard layout). Optional path fixes are **opt-in** via `--subst`.
+**Stage 2 chunk helper (`stage2_chunk.py`)**
+
+- `--parquet` — repo-relative path, e.g. `Parquet/remove_part0.parquet` (always included in the download set).
+- `--chunk-dir` — `local_dir` for HF download and `--dataset-root` for the build.
+- `--allow-pattern` — repeat; extra `snapshot_download` patterns (image `*.tar` / `*.tar.split.*` globs).
+- `--download-only` — fetch slice only; exit before extract / audit / build.
+- `--skip-download` — chunk dir already populated.
+- `--no-extract` — skip automatic extract (no `*.tar.split.*` merge, no standalone `.tar` unpack).
+- `--delete-chunk-after` — after a successful build, remove `--chunk-dir`.
+- `--shard-prefix` — defaults to parquet stem (unique per slice).
+- `--min-resolve-rate` — audit threshold on strict pairs (default `1.0`).
+- `--allow-zero-strict-pairs` — allow parquets with no strict pairs (rare).
+- `--skip-audit` — disable parquet↔disk check (not recommended).
+- `--expected-zone` — same bucket/region sanity check as MagicBrush (`warn_bucket_zone`).
+- `--fix-hybrid-compose-paths` — force compose→hybrid path subst (also **auto** for parquet stem `hybrid_part*` unless `--no-auto-hybrid-compose`).
+- `--no-auto-hybrid-compose` — disable that auto behavior for `hybrid_part*.parquet`.
+- `--allow-empty-output` — allow success when zero samples pass validation (debug only).
+
+`stage2_chunk.py` logs **pre-download / post-extract / pre-build** disk usage like the MagicBrush uploader. There is **no** MagicBrush-only image cleanup (`--cleanup-corner`). Optional path fixes are **opt-in** via `--subst`.
+
+---
+
+## Differences vs MagicBrush (dataset shape)
+
+| | MagicBrush (`deepfusion`) | ImgEdit (`imgedit/`) |
+|---|---------------------------|------------------------|
+| Parquet rows | Embedded image structs / bytes | Nested **path lists** → files under `Singleturn/` / `Multiturn/` |
+| HF download | `hf_hub_download` per parquet | `snapshot_download` **allow_patterns** + tar **split merge** + optional whole **`.tar`** extract |
+| Shards | Often one parquet → one `shard-XXXX.tar` | Many samples per shard (`--samples-per-shard`); optional **`--shard-prefix`** per chunk |
+| Triplet layout | `{key}.jpg` / `.jpg2` / `.txt` | Same (shared `sanity_check_tar_triplet` / `gcloud storage cp -n` pattern) |
 
 ## Monitoring & Resume
 

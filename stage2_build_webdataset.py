@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Stage 2 — After a full local snapshot: strict WebDataset shards + upload to GCS.
+Stage 2 — Strict WebDataset shards + optional GCS upload.
 
 Keeps a sample only when exactly one input path and one output path are declared,
 both files exist, read successfully, and JPEG re-encode succeeds.
 Optional --subst OLD:NEW only after you verified renames on disk.
+
+Use --shard-prefix when processing chunks so GCS object names do not collide across runs.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import argparse
 import hashlib
 import tarfile
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import pyarrow.parquet as pq
 from huggingface_hub import snapshot_download
@@ -29,10 +31,13 @@ from imgedit_lib import (
     sanity_check_tar_triplet,
     upload_shard_noclobber,
     gcs_object_exists,
+    warn_bucket_zone,
     write_json,
 )
 
 DEFAULT_REPO = "sysuyy/ImgEdit"
+# Same layout convention as deepfusion/dataset/upload_magicbrush_webdataset.py (override per zone).
+DEFAULT_BUCKET = "gs://kmh-gcp-us-central1/data/imgedit"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +57,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--bucket",
         default="",
-        help="gs://bucket/prefix — empty means keep .tar files local only.",
+        help=f"gs://bucket/prefix — empty keeps .tar local only. Typical: {DEFAULT_BUCKET} (set zone to match VM).",
+    )
+    p.add_argument(
+        "--expected-zone",
+        default="",
+        help="If set, warn when this token is not contained in --bucket (deepfusion-style safety check).",
     )
     p.add_argument("--samples-per-shard", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=256)
@@ -69,6 +79,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-shards", type=int, default=0, help="Stop after N shards (debug).")
     p.add_argument("--report-path", default="", help="Default: <work-dir>/build_report.json")
+    p.add_argument(
+        "--shard-prefix",
+        default="",
+        help="Prefix for shard file names on disk/GCS, e.g. remove_part0 → remove_part0-shard-00000.tar (avoid collisions between chunk runs).",
+    )
+    p.add_argument(
+        "--parquets-only",
+        default="",
+        help="Comma-separated parquet basenames to process only, e.g. remove_part0.parquet,remove_part1.parquet",
+    )
     return p.parse_args()
 
 
@@ -82,6 +102,13 @@ def parse_substs(items: Sequence[str]) -> List[Tuple[str, str]]:
             raise ValueError(f"Bad --subst: {item}")
         out.append((old, new))
     return out
+
+
+def parse_parquets_only(s: str) -> Optional[Set[str]]:
+    if not s.strip():
+        return None
+    names = {x.strip() for x in s.split(",") if x.strip()}
+    return names if names else None
 
 
 def _row_dicts_from_batch(batch) -> List[Dict[str, Any]]:
@@ -98,35 +125,119 @@ def make_sample_key(parquet_stem: str, pair_index: int, prompt: str) -> str:
     return f"{parquet_stem}_{pair_index:08d}_{h}"
 
 
-def main() -> None:
-    args = parse_args()
-    subst_rules = parse_substs(args.subst)
-    work = Path(args.work_dir)
-    work.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.report_path) if args.report_path else work / "build_report.json"
+def shard_basename(shard_idx: int, shard_prefix: str) -> str:
+    body = f"shard-{shard_idx:05d}.tar"
+    if shard_prefix.strip():
+        return f"{shard_prefix.strip()}-{body}"
+    return body
 
-    if args.full_snapshot_download:
-        root = Path(args.dataset_root or "/dev/shm/imgedit_full").resolve()
-        root.mkdir(parents=True, exist_ok=True)
-        print(f"Full snapshot → {root}")
-        snapshot_download(
-            repo_id=args.repo,
-            repo_type="dataset",
-            local_dir=str(root),
-            local_dir_use_symlinks=False,
-        )
-        dataset_root = root
+
+def audit_parquet_resolution(
+    parquet_path: Path,
+    dataset_root: Path,
+    subst_rules: Sequence[Tuple[str, str]],
+    *,
+    batch_size: int = 2048,
+    max_examples: int = 8,
+) -> Dict[str, Any]:
+    """
+    Check that strict (single in / single out) paths in the parquet resolve to real files
+    under dataset_root. Does not read image bytes; only path existence.
+    """
+    cols = parquet_schema_columns(parquet_path)
+    mapping = detect_field_mapping(cols)
+    mode, orig_c, edit_c, text_c = mapping[3], mapping[0], mapping[1], mapping[2]
+    if mode == "unknown":
+        return {"error": "unknown_schema", "parquet": parquet_path.name}
+
+    stats: Dict[str, Any] = {
+        "parquet": parquet_path.name,
+        "rows": 0,
+        "strict_pairs": 0,
+        "both_paths_exist": 0,
+        "broken_pairs": 0,
+        "examples_broken": [],
+    }
+
+    def note_broken(inp: str, out: str, reason: str) -> None:
+        if len(stats["examples_broken"]) >= max_examples:
+            return
+        stats["examples_broken"].append({"input": inp, "output": out, "reason": reason})
+
+    pf = pq.ParquetFile(parquet_path)
+    for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
+        stats["rows"] += batch.num_rows
+        for row in _row_dicts_from_batch(batch):
+            for inp_rel, out_rel, _ in iter_imgedit_pairs_from_row(
+                row, mode=mode, orig_col=orig_c or "", edit_col=edit_c or "", text_col=text_c
+            ):
+                stats["strict_pairs"] += 1
+                in_ok = bool(
+                    resolve_dataset_image_path(
+                        inp_rel,
+                        dataset_root=dataset_root,
+                        parquet_path=parquet_path,
+                        subst_rules=subst_rules,
+                    )
+                )
+                out_ok = bool(
+                    resolve_dataset_image_path(
+                        out_rel,
+                        dataset_root=dataset_root,
+                        parquet_path=parquet_path,
+                        subst_rules=subst_rules,
+                    )
+                )
+                if in_ok and out_ok:
+                    stats["both_paths_exist"] += 1
+                else:
+                    stats["broken_pairs"] += 1
+                    if not in_ok and not out_ok:
+                        note_broken(inp_rel, out_rel, "missing_both")
+                    elif not in_ok:
+                        note_broken(inp_rel, out_rel, "missing_input")
+                    else:
+                        note_broken(inp_rel, out_rel, "missing_output")
+
+    sp = stats["strict_pairs"]
+    if sp:
+        stats["resolve_rate"] = stats["both_paths_exist"] / sp
     else:
-        if not args.dataset_root:
-            raise SystemExit("Set --dataset-root or use --full-snapshot-download.")
-        dataset_root = Path(args.dataset_root).resolve()
+        stats["resolve_rate"] = None
+    return stats
 
+
+def run_build(
+    *,
+    dataset_root: Path,
+    work_dir: Path,
+    bucket: str,
+    subst_rules: Sequence[Tuple[str, str]],
+    samples_per_shard: int,
+    batch_size: int,
+    jpeg_quality: int,
+    max_side: Optional[int],
+    sanity_decode: int,
+    skip_existing: bool,
+    max_shards: int,
+    report_path: Path,
+    shard_prefix: str = "",
+    parquets_filter: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Core build loop; returns summary dict."""
+    work_dir.mkdir(parents=True, exist_ok=True)
     parquets = sorted(dataset_root.glob("Parquet/*.parquet"))
     if not parquets:
-        raise SystemExit(f"No Parquet/*.parquet under {dataset_root}")
+        raise FileNotFoundError(f"No Parquet/*.parquet under {dataset_root}")
+    if parquets_filter is not None:
+        parquets = [p for p in parquets if p.name in parquets_filter]
+        if not parquets:
+            raise FileNotFoundError(
+                f"No parquets matched filter {parquets_filter!r} under {dataset_root / 'Parquet'}"
+            )
 
-    max_side = None if args.max_side <= 0 else args.max_side
-    bucket = (args.bucket or "").strip().rstrip("/")
+    max_side_eff = None if max_side is not None and max_side <= 0 else max_side
+    bucket_eff = (bucket or "").strip().rstrip("/")
 
     buffer: List[Tuple[str, bytes, bytes, bytes]] = []
     shard_idx = 0
@@ -139,11 +250,11 @@ def main() -> None:
         if not buffer:
             return
         n = len(buffer)
-        tar_name = f"shard-{shard_idx:05d}.tar"
-        tar_path = work / tar_name
-        gcs_uri = f"{bucket}/{tar_name}" if bucket else ""
+        tar_name = shard_basename(shard_idx, shard_prefix)
+        tar_path = work_dir / tar_name
+        gcs_uri = f"{bucket_eff}/{tar_name}" if bucket_eff else ""
 
-        if args.skip_existing and gcs_uri and gcs_object_exists(gcs_uri):
+        if skip_existing and gcs_uri and gcs_object_exists(gcs_uri):
             print(f"  skip (exists) {gcs_uri}")
             buffer.clear()
             shard_idx += 1
@@ -155,9 +266,9 @@ def main() -> None:
                 add_tar_bytes(tf, f"{key}.jpg2", j2)
                 add_tar_bytes(tf, f"{key}.txt", txt)
 
-        sanity_check_tar_triplet(str(tar_path), n, decode_samples=args.sanity_decode)
-        if bucket:
-            upload_shard_noclobber(str(tar_path), bucket + "/")
+        sanity_check_tar_triplet(str(tar_path), n, decode_samples=sanity_decode)
+        if bucket_eff:
+            upload_shard_noclobber(str(tar_path), bucket_eff + "/")
             tar_path.unlink(missing_ok=True)
         buffer.clear()
         shard_idx += 1
@@ -186,7 +297,7 @@ def main() -> None:
 
         print(f"{stem}: processing…")
         pf = pq.ParquetFile(pq_path)
-        for batch in pf.iter_batches(batch_size=args.batch_size, columns=cols):
+        for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
             st["rows"] += batch.num_rows
             for row in _row_dicts_from_batch(batch):
                 for inp_rel, out_rel, prompt in iter_imgedit_pairs_from_row(
@@ -226,8 +337,8 @@ def main() -> None:
                         st["missing_file"] += 1
                         continue
 
-                    jpg_in = encode_jpeg(raw_in, max_side=max_side, jpeg_quality=args.jpeg_quality)
-                    jpg_out = encode_jpeg(raw_out, max_side=max_side, jpeg_quality=args.jpeg_quality)
+                    jpg_in = encode_jpeg(raw_in, max_side=max_side_eff, jpeg_quality=jpeg_quality)
+                    jpg_out = encode_jpeg(raw_out, max_side=max_side_eff, jpeg_quality=jpeg_quality)
                     if not jpg_in or not jpg_out:
                         st["bad_image"] += 1
                         continue
@@ -239,42 +350,83 @@ def main() -> None:
                     st["kept"] += 1
                     total_kept += 1
 
-                    if len(buffer) >= args.samples_per_shard:
+                    if len(buffer) >= samples_per_shard:
                         flush_shard()
-                        if args.max_shards and shard_idx >= args.max_shards:
+                        if max_shards and shard_idx >= max_shards:
                             per_file_stats.append(st)
-                            write_json(
-                                report_path,
-                                {
-                                    "dataset_root": str(dataset_root),
-                                    "stopped_early_max_shards": args.max_shards,
-                                    "shards_written": shard_idx,
-                                    "total_kept": total_kept,
-                                    "bucket": bucket or None,
-                                    "per_parquet": per_file_stats + [st],
-                                },
-                            )
+                            summary = {
+                                "dataset_root": str(dataset_root),
+                                "stopped_early_max_shards": max_shards,
+                                "shards_written": shard_idx,
+                                "total_kept": total_kept,
+                                "bucket": bucket_eff or None,
+                                "shard_prefix": shard_prefix or None,
+                                "per_parquet": per_file_stats + [st],
+                            }
+                            write_json(report_path, summary)
                             print(f"Stopped (--max-shards). Report: {report_path}")
-                            return
+                            return summary
 
         per_file_stats.append(st)
         print(f"  kept {st['kept']} / pairs_declared {st['pairs_emitted']} / rows {st['rows']}")
 
     flush_shard()
 
-    write_json(
-        report_path,
-        {
-            "dataset_root": str(dataset_root),
-            "parquet_files": len(parquets),
-            "shards_written": shard_idx,
-            "total_kept": total_kept,
-            "bucket": bucket or None,
-            "subst_rules": list(subst_rules),
-            "per_parquet": per_file_stats,
-        },
-    )
+    summary = {
+        "dataset_root": str(dataset_root),
+        "parquet_files": len(parquets),
+        "shards_written": shard_idx,
+        "total_kept": total_kept,
+        "bucket": bucket_eff or None,
+        "shard_prefix": shard_prefix or None,
+        "subst_rules": list(subst_rules),
+        "per_parquet": per_file_stats,
+    }
+    write_json(report_path, summary)
     print(f"\nDone. Shards: {shard_idx}, samples: {total_kept}. Report: {report_path}")
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+    warn_bucket_zone(args.bucket, args.expected_zone)
+    subst_rules = parse_substs(args.subst)
+    work = Path(args.work_dir)
+    report_path = Path(args.report_path) if args.report_path else work / "build_report.json"
+    parquets_filter = parse_parquets_only(args.parquets_only)
+
+    if args.full_snapshot_download:
+        root = Path(args.dataset_root or "/dev/shm/imgedit_full").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        print(f"Full snapshot → {root}")
+        snapshot_download(
+            repo_id=args.repo,
+            repo_type="dataset",
+            local_dir=str(root),
+            local_dir_use_symlinks=False,
+        )
+        dataset_root = root
+    else:
+        if not args.dataset_root:
+            raise SystemExit("Set --dataset-root or use --full-snapshot-download.")
+        dataset_root = Path(args.dataset_root).resolve()
+
+    run_build(
+        dataset_root=dataset_root,
+        work_dir=work,
+        bucket=args.bucket,
+        subst_rules=subst_rules,
+        samples_per_shard=args.samples_per_shard,
+        batch_size=args.batch_size,
+        jpeg_quality=args.jpeg_quality,
+        max_side=args.max_side,
+        sanity_decode=args.sanity_decode,
+        skip_existing=args.skip_existing,
+        max_shards=args.max_shards,
+        report_path=report_path,
+        shard_prefix=args.shard_prefix,
+        parquets_filter=parquets_filter,
+    )
 
 
 if __name__ == "__main__":
