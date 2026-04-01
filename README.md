@@ -36,6 +36,7 @@ Optional: set `HF_TOKEN` if your environment needs authenticated Hugging Face ac
 2. Scans every parquet in batch order and counts **strict** pairs: exactly one input path and one output path per edit (rows with multiple reference images are skipped).
 3. Records each `results_*` path prefix and whether that substring appears **anywhere** in the Hub file list (rough signal for “is this tree published?”).
 4. Writes `exploration_report.json` (default: under `--local-dir`).
+5. Optional **`--log-file`**: append a text log of the run (stdout still shows the same lines).
 
 **Stage 2**
 
@@ -57,13 +58,15 @@ Optional: set `HF_TOKEN` if your environment needs authenticated Hugging Face ac
 cd imgedit
 python stage1_explore.py \
   --local-dir /dev/shm/imgedit_stage1 \
-  --report-path /dev/shm/imgedit_stage1/exploration_report.json
+  --report-path /dev/shm/imgedit_stage1/exploration_report.json \
+  --log-file /kmh-nfs-ssd-us-mount/code/<you>/imgedit/stage1_explore.log
 ```
 
 Hub-only probe (no parquet download):
 
 ```bash
-python stage1_explore.py --no-download --local-dir /dev/shm/imgedit_stage1
+python stage1_explore.py --no-download --local-dir /dev/shm/imgedit_stage1 \
+  --log-file /kmh-nfs-ssd-us-mount/code/<you>/imgedit/stage1_hub_only.log
 ```
 
 **Stage 2** after full download + extract (match `<zone>` to your VM; same pattern as other `deepfusion/dataset` buckets):
@@ -97,6 +100,7 @@ Run long jobs in `tmux`/`screen`.
 - `--local-dir` — partial snapshot + default report location.
 - `--no-download` — only call the Hub API; skip parquet analysis on disk.
 - `--report-path` — override JSON report path.
+- `--log-file` — append human-readable run log (UTF-8); parent dirs created; JSON report also records `log_file` when set.
 
 **Stage 2 (`stage2_build_webdataset.py`)**
 
