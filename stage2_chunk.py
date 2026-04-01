@@ -7,6 +7,9 @@ One parquet + matching archives at a time (disk-light), aligned with deepfusion 
   3) audit paths vs files on disk (strict single in / single out); drops bad/missing rows by not uploading them.
   4) build + valid upload only for rows that resolve, decode, and JPEG-encode; fail if nothing passes (like MagicBrush “no samples”).
   5) optional ``--delete-chunk-after``: remove downloaded parquet + extracted trees to free disk (audit JSON copied next to the build report).
+  6) optional ``--delete-chunk-on-failure``: on audit failure or zero kept samples, also remove chunk dir (same audit copy as success).
+
+Exit codes: 0 = success; 2 = audit below ``--min-resolve-rate``, zero strict pairs, unknown schema, or zero kept samples; 1 = other failures (CPython argparse may also use exit 2 for usage errors).
 
 Hybrid shards: paths often use ``results_compose_partN`` (and ``…_part6_fix``) while Hub ships ``results_hybrid`` tars. For ``Parquet/hybrid_part*.parquet``, compose→hybrid subst is **auto-enabled** unless ``--no-auto-hybrid-compose``; you can still force it with ``--fix-hybrid-compose-paths``. Always set ``--allow-pattern`` to the Hub’s ``results_hybrid*`` archive globs.
 """
@@ -41,6 +44,10 @@ from stage2_build_webdataset import (
 
 logger = logging.getLogger(__name__)
 
+# Distinct for shell orchestration (e.g. run_all_chunks.sh). Note: argparse also uses code 2 for usage errors.
+EXIT_GENERIC_FAILURE = 1
+EXIT_AUDIT_OR_EMPTY_SKIP = 2
+
 TAR_SPLIT_RE = re.compile(r"^(.+\.tar)\.split\.(\d+)$")
 
 
@@ -56,6 +63,35 @@ def setup_logging() -> None:
 def normalize_repo_path(p: str) -> str:
     p = p.strip().lstrip("./")
     return p.lstrip("/")
+
+
+def _preserve_audit_and_rmtree_chunk(chunk: Path, report_path: Path, pq_stem: str) -> None:
+    """Copy audit JSON next to build report, then remove chunk dir (same as --delete-chunk-after)."""
+    preserved = chunk / f"audit_{pq_stem}.json"
+    if preserved.is_file():
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        dest = report_path.parent / preserved.name
+        shutil.copy2(preserved, dest)
+        logger.info("Preserved audit → %s", dest)
+    if chunk.is_dir():
+        logger.info("Removing chunk dir %s", chunk)
+        shutil.rmtree(chunk)
+
+
+def _audit_skip_exit(
+    message: str,
+    *,
+    chunk: Path,
+    report_path: Path,
+    pq_stem: str,
+    delete_chunk_on_failure: bool,
+) -> None:
+    """Audit / zero-output skip: log, optionally delete chunk dir, exit with EXIT_AUDIT_OR_EMPTY_SKIP."""
+    logger.error(message)
+    if delete_chunk_on_failure:
+        _preserve_audit_and_rmtree_chunk(chunk, report_path, pq_stem)
+        logger.info("Chunk dir removed (--delete-chunk-on-failure).")
+    sys.exit(EXIT_AUDIT_OR_EMPTY_SKIP)
 
 
 def merge_and_extract_tar_splits(chunk_dir: Path) -> int:
@@ -163,9 +199,22 @@ def parse_args() -> argparse.Namespace:
         help="After a successful build, remove --chunk-dir (verify path before enabling).",
     )
     p.add_argument(
+        "--delete-chunk-on-failure",
+        dest="delete_chunk_on_failure",
+        action="store_true",
+        help=(
+            "On audit failure (below min-resolve-rate, zero strict pairs, unknown schema) or "
+            "zero kept samples, copy audit next to report and remove --chunk-dir before exit "
+            f"(exit {EXIT_AUDIT_OR_EMPTY_SKIP})."
+        ),
+    )
+    p.add_argument(
         "--shard-prefix",
         default="",
-        help="Shard filename prefix (default: parquet stem, e.g. remove_part0).",
+        help=(
+            "Prefix for shard basenames (empty = MagicBrush-style shard-00000.tar; "
+            "set explicitly, e.g. remove_part0, when using a flat GCS prefix without per-chunk subdirs)."
+        ),
     )
     p.add_argument("--skip-audit", action="store_true", help="Skip parquet↔disk path audit (not recommended).")
     p.add_argument(
@@ -254,8 +303,9 @@ def main() -> None:
     pq_rel = normalize_repo_path(args.parquet)
     pq_basename = Path(pq_rel).name
     pq_stem = Path(pq_rel).stem
+    report_path = Path(args.report_path) if args.report_path else work / "chunk_build_report.json"
     parquets_filter = {pq_basename}
-    shard_prefix = (args.shard_prefix or pq_stem).strip()
+    shard_prefix = args.shard_prefix.strip()
     hybrid_fix, hybrid_reason = _hybrid_compose_fix_mode(
         pq_stem=pq_stem,
         explicit=bool(args.fix_hybrid_compose_paths),
@@ -277,14 +327,16 @@ def main() -> None:
         )
 
     if args.skip_download and args.download_only:
-        raise SystemExit("Choose at most one of --skip-download / --download-only.")
+        logger.error("Choose at most one of --skip-download / --download-only.")
+        sys.exit(EXIT_GENERIC_FAILURE)
 
     if not args.skip_download:
         if not args.allow_pattern:
-            raise SystemExit(
+            logger.error(
                 "Pass at least one --allow-pattern for image archives "
                 "(the parquet is added automatically), or use --skip-download."
             )
+            sys.exit(EXIT_GENERIC_FAILURE)
         chunk.mkdir(parents=True, exist_ok=True)
         log_paths_disk_usage("pre_download", [chunk, work])
         patterns: List[str] = [pq_rel] + list(args.allow_pattern)
@@ -314,7 +366,8 @@ def main() -> None:
 
     pq_local = chunk / pq_rel
     if not pq_local.is_file():
-        raise SystemExit(f"Missing parquet at {pq_local} (check --parquet and --chunk-dir).")
+        logger.error("Missing parquet at %s (check --parquet and --chunk-dir).", pq_local)
+        sys.exit(EXIT_GENERIC_FAILURE)
 
     if not args.skip_audit:
         audit = audit_parquet_resolution(
@@ -329,31 +382,37 @@ def main() -> None:
         logger.info("Wrote audit %s", audit_path)
 
         if audit.get("error") == "unknown_schema":
-            raise SystemExit(f"Audit failed: unknown schema for {pq_basename}")
+            _audit_skip_exit(
+                f"Audit failed: unknown schema for {pq_basename}",
+                chunk=chunk,
+                report_path=report_path,
+                pq_stem=pq_stem,
+                delete_chunk_on_failure=args.delete_chunk_on_failure,
+            )
 
         strict = audit.get("strict_pairs", 0)
         if strict == 0 and not args.allow_zero_strict_pairs:
-            raise SystemExit(
+            _audit_skip_exit(
                 f"Audit: 0 strict pairs in {pq_basename} (multi-input-only or empty?). "
-                f"Use --allow-zero-strict-pairs to force build anyway."
+                f"Use --allow-zero-strict-pairs to force build anyway.",
+                chunk=chunk,
+                report_path=report_path,
+                pq_stem=pq_stem,
+                delete_chunk_on_failure=args.delete_chunk_on_failure,
             )
 
         if strict > 0:
             rate = audit.get("resolve_rate")
             if rate is None or rate < args.min_resolve_rate:
-                logger.error(
-                    "Audit: resolve_rate=%s (need >= %s). broken_pairs=%s examples=%s",
-                    rate,
-                    args.min_resolve_rate,
-                    audit.get("broken_pairs"),
-                    audit.get("examples_broken"),
-                )
-                raise SystemExit(
-                    f"Audit failed: parquet paths vs on-disk files (resolve_rate {rate}, "
-                    f"min {args.min_resolve_rate}). Fix downloads/extract or set --min-resolve-rate."
+                _audit_skip_exit(
+                    f"Audit failed: resolve_rate={rate} (need >= {args.min_resolve_rate}); "
+                    f"broken_pairs={audit.get('broken_pairs')} examples={audit.get('examples_broken')}",
+                    chunk=chunk,
+                    report_path=report_path,
+                    pq_stem=pq_stem,
+                    delete_chunk_on_failure=args.delete_chunk_on_failure,
                 )
 
-    report_path = Path(args.report_path) if args.report_path else work / "chunk_build_report.json"
     log_paths_disk_usage("pre_build", [chunk, work])
 
     try:
@@ -378,23 +437,22 @@ def main() -> None:
         raise
 
     if not isinstance(summary, dict):
-        raise RuntimeError(f"run_build returned unexpected value (expected dict): {summary!r}")
+        logger.error("run_build returned unexpected value (expected dict): %r", summary)
+        sys.exit(EXIT_GENERIC_FAILURE)
 
     total_kept = int(summary.get("total_kept", 0))
     if total_kept == 0 and not args.allow_empty_output:
-        raise SystemExit(
+        _audit_skip_exit(
             "No samples passed validation (paths + decode + JPEG). "
-            "Chunk dir kept for debugging. Fix data/patterns/subst or pass --allow-empty-output to override."
+            "Fix data/patterns/subst or pass --allow-empty-output to override.",
+            chunk=chunk,
+            report_path=report_path,
+            pq_stem=pq_stem,
+            delete_chunk_on_failure=args.delete_chunk_on_failure,
         )
 
     if args.delete_chunk_after:
-        preserved = chunk / f"audit_{pq_stem}.json"
-        if preserved.is_file():
-            dest = report_path.parent / preserved.name
-            shutil.copy2(preserved, dest)
-            logger.info("Preserved audit → %s", dest)
-        logger.info("Removing chunk dir %s", chunk)
-        shutil.rmtree(chunk)
+        _preserve_audit_and_rmtree_chunk(chunk, report_path, pq_stem)
 
 
 if __name__ == "__main__":

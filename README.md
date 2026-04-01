@@ -96,7 +96,7 @@ Run long jobs in `tmux`/`screen`.
 
 ## Chunk workflow (one parquet + tars → validate → upload → delete)
 
-Full ImgEdit is multi‑terabyte on Hugging Face. With **limited local disk**, run **one chunk at a time**: download one parquet (via `--parquet`) plus the `Singleturn` / `Multiturn` globs for that slice, **merge `*.tar.split.*` in order and extract** inside `--chunk-dir`, **audit** that strict parquet paths resolve on disk, build with a **unique shard prefix** (default: parquet stem), upload, then **`--delete-chunk-after`** to remove the chunk.
+Full ImgEdit is multi‑terabyte on Hugging Face. With **limited local disk**, run **one chunk at a time**: download one parquet (via `--parquet`) plus the `Singleturn` / `Multiturn` globs for that slice, **merge `*.tar.split.*` in order and extract** inside `--chunk-dir`, **audit** that strict parquet paths resolve on disk, build shards (default **`--shard-prefix` empty** = `shard-00000.tar` like MagicBrush; use a **per-chunk GCS subdir** or set `--shard-prefix` for a flat bucket), upload, then **`--delete-chunk-after`** to remove the chunk.
 
 **Single command** (example — adjust `--allow-pattern` to match [the repo](https://huggingface.co/datasets/sysuyy/ImgEdit/tree/main)):
 
@@ -134,7 +134,7 @@ Typical lines from a full Stage 1 pass and how Stage 2 treats them:
 
 **Optional:** `--download-only` then re-run with `--skip-download` if you want a two-step handoff. **`--no-extract`** if you already merged/extracted manually. **`--skip-audit`** only for emergencies.
 
-Shards on GCS look like `remove_part0-shard-00000.tar`, so later chunks **do not overwrite** earlier ones. Override with **`--shard-prefix`** when needed.
+With an empty `--shard-prefix`, shards look like `shard-00000.tar`; **`run_all_chunks.sh`** uses **`--bucket $BUCKET/$STEM`** so each parquet lands under its own prefix. For a **flat** bucket, set **`--shard-prefix`** (e.g. parquet stem) so names do not collide.
 
 You can also drive **`stage2_build_webdataset.py`** alone with `--dataset-root` pointing at a partial tree and **`--shard-prefix`** + **`--parquets-only`** if you manage downloads yourself.
 
@@ -176,7 +176,7 @@ You can also drive **`stage2_build_webdataset.py`** alone with `--dataset-root` 
 - `--skip-download` — chunk dir already populated.
 - `--no-extract` — skip automatic extract (no `*.tar.split.*` merge, no standalone `.tar` unpack).
 - `--delete-chunk-after` — after a successful build, remove `--chunk-dir`.
-- `--shard-prefix` — defaults to parquet stem (unique per slice).
+- `--shard-prefix` — defaults to empty (`shard-NNNNN.tar`); set explicitly when using one shared GCS prefix without subdirs.
 - `--min-resolve-rate` — audit threshold on strict pairs (default `1.0`).
 - `--allow-zero-strict-pairs` — allow parquets with no strict pairs (rare).
 - `--skip-audit` — disable parquet↔disk check (not recommended).

@@ -2,17 +2,21 @@
 # Process every ImgEdit parquet slice with explicit Hub archive globs.
 # Requires: gcloud auth, HF access, stage1 parquets available to snapshot_download (or HF cache).
 #
-# Skipped (no archives on Hub for strict WDS): reference_replace_part1, reference_replace_part7
+# Does not use `set -e`: one failed chunk does not stop the remainder.
+# SKIPPED (exit 2 from stage2_chunk): audit below --min-resolve-rate, zero samples, etc.
 #
-# Optional: if remove_part0 fails audit (partial Hub data), re-run that stem with e.g.
-#   --min-resolve-rate 0.753
-# appended manually or extend run_chunk to accept extra python args.
+# Skipped by omission (no chunk run): reference_replace_part1, reference_replace_part7
 
-set -euo pipefail
+set -uo pipefail
 
 BUCKET="${BUCKET:-gs://kmh-gcp-us-central1/data/imgedit}"
 ZONE="${ZONE:-us-central1}"
 LOG="${LOG:-/dev/shm/imgedit_run.log}"
+SUMMARY="${SUMMARY:-/dev/shm/imgedit_summary.log}"
+
+CNT_SUCCESS=0
+CNT_SKIPPED=0
+CNT_FAILED=0
 
 exec > >(tee -a "${LOG}") 2>&1
 
@@ -20,8 +24,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Usage: run_chunk STEM [--flags for stage2_chunk.py...] PATTERN [PATTERN...]
-# Patterns are snapshot_download allow_patterns (e.g. Singleturn/results_*.tar.split.*).
-# Flags must start with -- and are passed through (e.g. --fix-hybrid-compose-paths).
 run_chunk() {
   local stem="$1"
   shift
@@ -36,8 +38,11 @@ run_chunk() {
       shift
     fi
   done
+
+  local code=0
   echo ""
   echo "========== $(date -Is) ========== ${stem}"
+
   python stage2_chunk.py \
     --chunk-dir "/dev/shm/imgedit_chunk_${stem}" \
     --parquet "Parquet/${stem}.parquet" \
@@ -46,11 +51,32 @@ run_chunk() {
     --work-dir "/dev/shm/imgedit_wds_${stem}" \
     --bucket "${BUCKET}/${stem}" \
     --expected-zone "${ZONE}" \
+    --shard-prefix "" \
+    --min-resolve-rate 1.00 \
     --skip-existing \
-    --delete-chunk-after
+    --delete-chunk-after \
+    --delete-chunk-on-failure \
+    || code=$?
+
+  # Safety net: always free /dev/shm slice dirs (Python also cleans chunk on success/skip when flags set).
+  rm -rf "/dev/shm/imgedit_chunk_${stem}"
+  rm -rf "/dev/shm/imgedit_wds_${stem}"
+
+  local dest="${BUCKET}/${stem}"
+  if [[ "${code}" -eq 0 ]]; then
+    echo "SUCCESS: ${stem} → ${dest}" | tee -a "${SUMMARY}"
+    CNT_SUCCESS=$((CNT_SUCCESS + 1))
+  elif [[ "${code}" -eq 2 ]]; then
+    echo "SKIPPED: ${stem} → audit_below_threshold_or_zero_samples_or_unknown_schema (exit ${code})" | tee -a "${SUMMARY}"
+    CNT_SKIPPED=$((CNT_SKIPPED + 1))
+  else
+    echo "FAILED: ${stem} → exit_code=${code} (unexpected or build error)" | tee -a "${SUMMARY}"
+    CNT_FAILED=$((CNT_FAILED + 1))
+  fi
 }
 
-echo "run_all_chunks.sh start $(date -Is)  BUCKET=${BUCKET}  ZONE=${ZONE}"
+echo "run_all_chunks.sh start $(date -Is)  BUCKET=${BUCKET}  ZONE=${ZONE}  SUMMARY=${SUMMARY}"
+echo "# run_all_chunks start $(date -Is) BUCKET=${BUCKET}" >> "${SUMMARY}"
 
 # --- Singleturn ---
 run_chunk action_part1 Singleturn/action_part1.tar.split.*
@@ -74,7 +100,6 @@ run_chunk background_part3 Singleturn/results_background_laion_part3.tar.split.*
 run_chunk background_part5 Singleturn/results_background_laion_part5.tar.split.*
 run_chunk background_part7 Singleturn/results_background_laion_part7.tar.split.*
 
-# Explicit compose→hybrid path subst (batch script does not rely on stem auto-detection)
 run_chunk hybrid_part0 Singleturn/results_hybrid_part0.tar.split.* --fix-hybrid-compose-paths
 run_chunk hybrid_part2 Singleturn/results_hybrid_part2.tar.split.* --fix-hybrid-compose-paths
 run_chunk hybrid_part6 Singleturn/results_hybrid_part6.tar.split.* --fix-hybrid-compose-paths
@@ -100,6 +125,17 @@ run_chunk content_memory_part2 Multiturn/results_content_memory_part2.tar.split.
 run_chunk content_understanding_part2 Multiturn/results_content_understanding_part2.tar.split.*
 run_chunk version_backtracking_part0 Multiturn/results_version_backtracking_part0.tar.split.*
 
-# reference_replace_part1 / reference_replace_part7 — skipped (no matching strict-pair archives per project notes)
+echo ""
+echo "========== TOTALS $(date -Is) =========="
+echo "SUCCESS (uploaded): ${CNT_SUCCESS}"
+echo "SKIPPED (audit / zero samples / exit 2): ${CNT_SKIPPED}"
+echo "FAILED (other / exit ≠ 0,2): ${CNT_FAILED}"
+{
+  echo ""
+  echo "========== TOTALS $(date -Is) =========="
+  echo "SUCCESS (uploaded): ${CNT_SUCCESS}"
+  echo "SKIPPED (audit / zero samples / exit 2): ${CNT_SKIPPED}"
+  echo "FAILED (other): ${CNT_FAILED}"
+} >> "${SUMMARY}"
 
 echo "run_all_chunks.sh done $(date -Is)"
