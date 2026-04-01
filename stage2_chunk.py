@@ -377,6 +377,9 @@ def main() -> None:
         logger.exception("Build failed; chunk-dir left at %s", chunk)
         raise
 
+    if not isinstance(summary, dict):
+        raise RuntimeError(f"run_build returned unexpected value (expected dict): {summary!r}")
+
     total_kept = int(summary.get("total_kept", 0))
     if total_kept == 0 and not args.allow_empty_output:
         raise SystemExit(
