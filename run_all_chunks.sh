@@ -34,6 +34,10 @@ run_chunk() {
     if [[ "$1" == --* ]]; then
       extras+=("$1")
       shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        extras+=("$1")
+        shift
+      fi
     else
       allow+=(--allow-pattern "$1")
       shift
@@ -80,10 +84,10 @@ echo "run_all_chunks.sh start $(date -Is)  BUCKET=${BUCKET}  ZONE=${ZONE}  SUMMA
 echo "# run_all_chunks start $(date -Is) BUCKET=${BUCKET}" >> "${SUMMARY}"
 
 # --- Singleturn ---
-run_chunk action_part1 Singleturn/action_part1.tar.split.*
-run_chunk action_part2 Singleturn/action_part2.tar.split.*
-run_chunk action_part3 Singleturn/action_part3.tar.split.*
-run_chunk action_part4 Singleturn/action_part4.tar.split.*
+run_chunk action_part1 Singleturn/action_part1.tar.split.* --image-subdir Singleturn/part1
+run_chunk action_part2 Singleturn/action_part2.tar.split.* --image-subdir Singleturn/part2
+run_chunk action_part3 Singleturn/action_part3.tar.split.* --image-subdir Singleturn/part3
+run_chunk action_part4 Singleturn/action_part4.tar.split.* --image-subdir Singleturn/part4
 
 run_chunk add_part0 Singleturn/results_add_laion_part0.tar.split.*
 run_chunk add_part1 Singleturn/results_add_laion_part1.tar.split.*
