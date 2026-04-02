@@ -121,9 +121,9 @@ run_chunk style_transfer Singleturn/results_style_transfer.tar.split.*
 run_chunk style_transfer_part0 Singleturn/results_style_transfer_part0.tar.split.*
 
 # --- Multiturn ---
-run_chunk content_memory_part2 Multiturn/results_content_memory_part2.tar.split.*
-run_chunk content_understanding_part2 Multiturn/results_content_understanding_part2.tar.split.*
-run_chunk version_backtracking_part0 Multiturn/results_version_backtracking_part0.tar.split.*
+# run_chunk content_memory_part2 Multiturn/results_content_memory_part2.tar.split.*
+# run_chunk content_understanding_part2 Multiturn/results_content_understanding_part2.tar.split.*
+# run_chunk version_backtracking_part0 Multiturn/results_version_backtracking_part0.tar.split.*
 
 echo ""
 echo "========== TOTALS $(date -Is) =========="

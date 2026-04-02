@@ -17,14 +17,13 @@ Hybrid shards: paths often use ``results_compose_partN`` (and ``…_part6_fix``)
 from __future__ import annotations
 
 import argparse
-import io
 import logging
 import re
 import shutil
 import sys
 import tarfile
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import BinaryIO, Dict, List, Optional, Sequence, Tuple
 
 from huggingface_hub import snapshot_download
 
@@ -49,6 +48,65 @@ EXIT_GENERIC_FAILURE = 1
 EXIT_AUDIT_OR_EMPTY_SKIP = 2
 
 TAR_SPLIT_RE = re.compile(r"^(.+\.tar)\.split\.(\d+)$")
+
+# `tarfile` streaming reads; keep each read() bounded so we never load a whole split or the full merged tar.
+_MERGE_READ_BUFSIZE = 4 * 1024 * 1024
+
+
+class _TarSplitConcatReader:
+    """
+    File-like object that yields split parts in order for ``tarfile.open(..., mode='r|*')``.
+    Avoids BytesIO (~full archive RAM) and avoids writing a second full ``.tar`` to disk.
+
+    After each part is fully read, it is **unlinked** immediately so peak disk can drop from
+    ~(T + E) toward ~(max(T, E)) in the best case (T = total split bytes, E = extracted payload),
+    depending on how tar members interleave with split boundaries.
+    """
+
+    def __init__(self, paths: List[Path]) -> None:
+        self._paths = paths
+        self._idx = 0
+        self._fp: Optional[BinaryIO] = None
+
+    def _unlink_consumed_split(self) -> None:
+        """Remove the split file we just finished reading (index _idx - 1)."""
+        prev_i = self._idx - 1
+        if prev_i < 0:
+            return
+        done = self._paths[prev_i]
+        try:
+            done.unlink(missing_ok=True)
+            logger.debug("Removed consumed split %s", done.name)
+        except OSError as exc:
+            logger.warning("Could not remove consumed split %s: %s", done, exc)
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        chunks: List[bytes] = []
+        want = size
+        while want < 0 or want > 0:
+            if self._fp is None:
+                if self._idx >= len(self._paths):
+                    break
+                self._fp = open(self._paths[self._idx], "rb")
+                self._idx += 1
+            to_read = _MERGE_READ_BUFSIZE if want < 0 else min(_MERGE_READ_BUFSIZE, want)
+            piece = self._fp.read(to_read)
+            if not piece:
+                self._fp.close()
+                self._fp = None
+                self._unlink_consumed_split()
+                continue
+            chunks.append(piece)
+            if want >= 0:
+                want -= len(piece)
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if self._fp is not None:
+            self._fp.close()
+            self._fp = None
 
 
 def setup_logging() -> None:
@@ -98,6 +156,11 @@ def merge_and_extract_tar_splits(chunk_dir: Path) -> int:
     """
     Find files named <name>.tar.split.NNN, merge pieces in numeric order, extract under the
     same directory, then remove split files. Returns the number of merged archives processed.
+
+    Merging uses ``tarfile`` streaming mode over a concatenated reader so RAM stays bounded
+    (no full-archive BytesIO / ``b"".join``). Each ``.split.NNN`` is deleted as soon as it is
+    fully read, which reduces **peak** disk from ~**(T + E)** toward often **~(max(T, E))** when
+    layout allows (never below **T** while the first split is still downloading / present).
     """
     groups: Dict[Tuple[Path, str], List[Tuple[int, Path]]] = {}
     for path in chunk_dir.rglob("*"):
@@ -122,14 +185,24 @@ def merge_and_extract_tar_splits(chunk_dir: Path) -> int:
                 f"Incomplete tar splits for {parent / base_tar_name}: "
                 f"have indices {sorted_idx}, expected contiguous {span[0]}..{span[-1]}"
             )
-        merged = b"".join(p.read_bytes() for _, p in parts)
-        bio = io.BytesIO(merged)
-        with tarfile.open(fileobj=bio, mode="r:*") as tf:
-            tf.extractall(path=parent)
+        ordered_paths = [p for _, p in parts]
+        total_b = sum(p.stat().st_size for p in ordered_paths)
+        cat = _TarSplitConcatReader(ordered_paths)
+        try:
+            with tarfile.open(fileobj=cat, mode="r|*") as tf:
+                tf.extractall(path=parent)
+        finally:
+            cat.close()
+            for p in ordered_paths:
+                p.unlink(missing_ok=True)
         n_done += 1
-        logger.info("Merged + extracted %s (%d parts) under %s", base_tar_name, len(parts), parent)
-        for _, pf in parts:
-            pf.unlink(missing_ok=True)
+        logger.info(
+            "Merged + extracted %s (%d parts, ~%.2f GiB) under %s (streaming; splits trimmed as read)",
+            base_tar_name,
+            len(parts),
+            total_b / (1024**3),
+            parent,
+        )
     return n_done
 
 

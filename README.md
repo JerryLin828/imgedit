@@ -2,7 +2,7 @@
 
 Two-stage conversion from Hugging Face dataset `sysuyy/ImgEdit` into WebDataset shards. **Only rows where both images exist on disk and decode cleanly are kept** (correctness over raw row count). Design mirrors `deepfusion/dataset/docs/magicbrush.md` and `upload_magicbrush_webdataset.py`: **`gcloud storage cp -n`**, `/dev/shm` scratch, optional **zone check** on the bucket path, and **disk usage logging** during chunk processing.
 
-- **Source format:** `Parquet/*.parquet` (lists of paths + `prompt`; multiturn uses a `data` column). Binary blobs live under `Singleturn/` and `Multiturn/` as `results_*.tar.split.*` and sometimes whole `.tar` archives; **`stage2_chunk.py`** merges splits, extracts standalone tars, then audits path resolution.
+- **Source format:** `Parquet/*.parquet` (lists of paths + `prompt`; multiturn uses a `data` column). Binary blobs live under `Singleturn/` and `Multiturn/` as `results_*.tar.split.*` and sometimes whole `.tar` archives; **`stage2_chunk.py`** merges splits with **streaming `tarfile` reads** (bounded RAM; each split is **unlinked after it is fully read** to shrink peak disk), extracts standalone tars, then audits path resolution.
 - **Processing strategy:**
   - **Stage 1:** small download (parquets + README + score JSON) and a JSON report (strict pair counts, coarse Hub prefix checks).
   - **Stage 2:** walk the full local tree, stream parquets, pack **validated** samples into `.tar` shards, upload with **`gcloud storage cp -n`**.
@@ -176,6 +176,7 @@ You can also drive **`stage2_build_webdataset.py`** alone with `--dataset-root` 
 - `--skip-download` — chunk dir already populated.
 - `--no-extract` — skip automatic extract (no `*.tar.split.*` merge, no standalone `.tar` unpack).
 - `--delete-chunk-after` — after a successful build, remove `--chunk-dir`.
+- `--delete-chunk-on-failure` — on audit failure (below `--min-resolve-rate`, zero strict pairs without `--allow-zero-strict-pairs`, unknown schema) or when **zero** samples pass validation after build, copy `audit_*.json` next to the build report and remove `--chunk-dir`, then exit **2** (same code path `run_all_chunks.sh` treats as *skipped*, not *failed*).
 - `--shard-prefix` — defaults to empty (`shard-NNNNN.tar`); set explicitly when using one shared GCS prefix without subdirs.
 - `--min-resolve-rate` — audit threshold on strict pairs (default `1.0`).
 - `--allow-zero-strict-pairs` — allow parquets with no strict pairs (rare).
@@ -184,6 +185,7 @@ You can also drive **`stage2_build_webdataset.py`** alone with `--dataset-root` 
 - `--fix-hybrid-compose-paths` — force compose→hybrid path subst (also **auto** for parquet stem `hybrid_part*` unless `--no-auto-hybrid-compose`).
 - `--no-auto-hybrid-compose` — disable that auto behavior for `hybrid_part*.parquet`.
 - `--allow-empty-output` — allow success when zero samples pass validation (debug only).
+- **Exit codes** — `0` success; `2` audit/skip paths (low resolve rate, zero strict pairs unless allowed, unknown schema, zero kept samples after build) and sometimes **argparse** usage errors; `1` other failures. Details: `stage2_chunk.py` module docstring.
 
 `stage2_chunk.py` logs **pre-download / post-extract / pre-build** disk usage like the MagicBrush uploader. There is **no** MagicBrush-only image cleanup (`--cleanup-corner`). Optional path fixes are **opt-in** via `--subst`.
 
