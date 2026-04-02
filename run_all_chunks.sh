@@ -61,6 +61,7 @@ run_chunk() {
     --skip-existing \
     --delete-chunk-after \
     --delete-chunk-on-failure \
+    --direct-download \
     || code=$?
 
   # Safety net: always free scratch dirs (Python also cleans chunk on success/skip when flags set).

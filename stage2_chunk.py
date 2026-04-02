@@ -18,16 +18,20 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shutil
 import sys
 import tarfile
+import time
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Sequence, Tuple
 
-from fnmatch import fnmatch
-
-from huggingface_hub import list_repo_files, snapshot_download
+import requests
+from huggingface_hub import hf_hub_url, list_repo_files, snapshot_download
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from imgedit_lib import (
     HYBRID_COMPOSE_SUBST,
@@ -53,6 +57,113 @@ TAR_SPLIT_RE = re.compile(r"^(.+\.tar)\.split\.(\d+)$")
 
 # `tarfile` streaming reads; keep each read() bounded so we never load a whole split or the full merged tar.
 _MERGE_READ_BUFSIZE = 4 * 1024 * 1024
+
+# Direct HTTP download defaults (mirrors deepfusion/dataset/upload_mario10m.py style).
+_DL_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MiB per iter_content chunk
+_DL_TIMEOUT = 300.0
+_DL_RETRIES = 5
+_DL_BACKOFF = 1.0
+
+
+def _make_download_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=_DL_RETRIES,
+        backoff_factor=_DL_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "HEAD"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _direct_download_file(
+    repo_id: str,
+    repo_path: str,
+    local_dir: Path,
+    token: Optional[str],
+    session: requests.Session,
+    chunk_size: int = _DL_CHUNK_SIZE,
+    timeout: float = _DL_TIMEOUT,
+    max_attempts: int = 3,
+) -> Path:
+    """
+    Stream one file from HF via resolved CDN URL (bypasses XET/snapshot_download overhead).
+
+    Writes to ``.part`` temp, atomic-renames on success. Skips if dest already exists with
+    matching ``Content-Length``.
+    """
+    dest = local_dir / repo_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    url = hf_hub_url(repo_id=repo_id, filename=repo_path, repo_type="dataset")
+    headers: Dict[str, str] = {}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+
+    expected: Optional[int] = None
+    try:
+        head = session.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        head.raise_for_status()
+        cl = head.headers.get("Content-Length")
+        if cl is not None:
+            expected = int(cl)
+    except Exception:
+        pass
+
+    if dest.is_file():
+        if expected is None or dest.stat().st_size == expected:
+            logger.info("Skip (already complete) %s", repo_path)
+            return dest
+        logger.info("Incomplete %s on disk (%d vs expected %d); redownloading.",
+                     repo_path, dest.stat().st_size, expected)
+        dest.unlink()
+
+    part = dest.with_suffix(dest.suffix + ".part")
+
+    for attempt in range(1, max_attempts + 1):
+        if part.exists():
+            part.unlink()
+        written = 0
+        t0 = time.monotonic()
+        try:
+            with session.get(url, stream=True, headers=headers, timeout=timeout) as resp:
+                resp.raise_for_status()
+                with open(part, "wb") as fp:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            fp.write(chunk)
+                            written += len(chunk)
+        except Exception as exc:
+            if part.exists():
+                part.unlink(missing_ok=True)
+            if attempt == max_attempts:
+                raise
+            logger.warning("Download error %s (attempt %d/%d): %s; retrying…",
+                           repo_path, attempt, max_attempts, exc)
+            time.sleep(_DL_BACKOFF * attempt)
+            continue
+
+        if expected is not None and written != expected:
+            if part.exists():
+                part.unlink(missing_ok=True)
+            if attempt == max_attempts:
+                raise IOError(
+                    f"Size mismatch for {repo_path}: expected {expected}, got {written}"
+                )
+            logger.warning("Size mismatch %s (%d vs %d, attempt %d/%d); retrying…",
+                           repo_path, written, expected, attempt, max_attempts)
+            continue
+
+        shutil.move(str(part), str(dest))
+        elapsed = time.monotonic() - t0
+        speed = (written / (1024**2)) / max(elapsed, 0.01)
+        logger.info("Downloaded %s (%.2f MiB, %.1f MiB/s)", repo_path, written / (1024**2), speed)
+        return dest
+
+    raise RuntimeError(f"Failed to download {repo_path} after {max_attempts} attempts")
 
 
 class _TarSplitConcatReader:
@@ -254,9 +365,18 @@ def parse_args() -> argparse.Namespace:
         help="Extra snapshot_download allow_patterns (repeat), e.g. Singleturn/results_*.tar.split.*",
     )
     p.add_argument(
+        "--direct-download",
+        action="store_true",
+        help=(
+            "Use direct HTTP streaming (requests + hf_hub_url) instead of snapshot_download for archive files. "
+            "Much faster for large splits — bypasses XET/HF cache overhead. "
+            "Reads HF_TOKEN from environment for auth."
+        ),
+    )
+    p.add_argument(
         "--download-only",
         action="store_true",
-        help="Only snapshot_download; exit before extract / audit / build.",
+        help="Only download; exit before extract / audit / build.",
     )
     p.add_argument(
         "--skip-download",
@@ -434,18 +554,37 @@ def main() -> None:
         )
 
         all_files = sorted(list_repo_files(args.repo, repo_type="dataset"))
-        for pattern in args.allow_pattern:
-            matched = sorted(f for f in all_files if fnmatch(f, pattern))
-            logger.info("Pattern %s → %d file(s)", pattern, len(matched))
-            for rel in matched:
-                logger.info("Downloading %s", rel)
-                snapshot_download(
-                    repo_id=args.repo,
-                    repo_type="dataset",
-                    local_dir=str(chunk),
-                    local_dir_use_symlinks=False,
-                    allow_patterns=[rel],
-                )
+
+        if args.direct_download:
+            token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+            if not token:
+                logger.warning("HF_TOKEN not set; --direct-download may fail for gated datasets.")
+            session = _make_download_session()
+            for pattern in args.allow_pattern:
+                matched = sorted(f for f in all_files if fnmatch(f, pattern))
+                logger.info("Pattern %s → %d file(s) [direct HTTP]", pattern, len(matched))
+                for rel in matched:
+                    _direct_download_file(
+                        repo_id=args.repo,
+                        repo_path=rel,
+                        local_dir=chunk,
+                        token=token,
+                        session=session,
+                    )
+        else:
+            for pattern in args.allow_pattern:
+                matched = sorted(f for f in all_files if fnmatch(f, pattern))
+                logger.info("Pattern %s → %d file(s)", pattern, len(matched))
+                for rel in matched:
+                    logger.info("Downloading %s", rel)
+                    snapshot_download(
+                        repo_id=args.repo,
+                        repo_type="dataset",
+                        local_dir=str(chunk),
+                        local_dir_use_symlinks=False,
+                        allow_patterns=[rel],
+                    )
+
         logger.info("Download finished (%d pattern(s), repo file list size %d).",
                      len(args.allow_pattern), len(all_files))
 
