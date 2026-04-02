@@ -289,6 +289,14 @@ def parse_args() -> argparse.Namespace:
             "set explicitly, e.g. remove_part0, when using a flat GCS prefix without per-chunk subdirs)."
         ),
     )
+    p.add_argument(
+        "--image-subdir",
+        default="",
+        help=(
+            "Prepend this subdirectory to bare image filenames (no directory component) before path resolution. "
+            "E.g. Singleturn/part1 for action_part* chunks."
+        ),
+    )
     p.add_argument("--skip-audit", action="store_true", help="Skip parquet↔disk path audit (not recommended).")
     p.add_argument(
         "--min-resolve-rate",
@@ -379,6 +387,7 @@ def main() -> None:
     report_path = Path(args.report_path) if args.report_path else work / "chunk_build_report.json"
     parquets_filter = {pq_basename}
     shard_prefix = args.shard_prefix.strip()
+    image_subdir = (args.image_subdir or "").strip()
     hybrid_fix, hybrid_reason = _hybrid_compose_fix_mode(
         pq_stem=pq_stem,
         explicit=bool(args.fix_hybrid_compose_paths),
@@ -448,9 +457,12 @@ def main() -> None:
             chunk,
             subst_rules,
             batch_size=args.batch_size,
+            image_subdir=image_subdir,
         )
         audit_path = chunk / f"audit_{pq_stem}.json"
         audit["subst_rules_applied"] = [[a, b] for a, b in subst_rules]
+        if image_subdir:
+            audit["image_subdir"] = image_subdir
         write_json(audit_path, audit)
         logger.info("Wrote audit %s", audit_path)
 
@@ -504,6 +516,7 @@ def main() -> None:
             report_path=report_path,
             shard_prefix=shard_prefix,
             parquets_filter=parquets_filter,
+            image_subdir=image_subdir,
         )
     except Exception:
         logger.exception("Build failed; chunk-dir left at %s", chunk)

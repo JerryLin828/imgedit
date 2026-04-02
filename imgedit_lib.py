@@ -70,6 +70,21 @@ def apply_rel_substitutions(rel: str, rules: Sequence[Tuple[str, str]]) -> str:
     return out
 
 
+def apply_image_subdir(rel: str, subdir: str) -> str:
+    """
+    Prepend ``subdir`` to bare filenames (no directory component) before path resolution.
+
+    Used for ``action_part*``-style parquets where cells are basename-only lists like
+    ``['img.jpg']`` while images extract under e.g. ``Singleturn/part1/``.
+    """
+    if not (subdir or "").strip():
+        return rel
+    p = Path(str(rel).strip())
+    if p.parent == Path("."):
+        return str(Path(subdir.strip()) / p.name)
+    return rel
+
+
 def first_relpath_from_list_cell(cell: Any) -> Optional[str]:
     """
     ImgEdit stores one path as nested lists, e.g. [['results_remove/.../original.png']].
@@ -290,12 +305,18 @@ def iter_imgedit_pairs_from_row(
         return
 
     if mode == "imgedit_lists":
-        ins = flatten_path_strings(row.get(orig_col))
-        outs = flatten_path_strings(row.get(edit_col))
-        if len(ins) != 1 or len(outs) != 1:
-            return
-        prompt = str(row.get(text_col) or "").strip()
-        yield ins[0], outs[0], prompt
+        # Top-level single slot per column (e.g. action_part*: one list per cell); flatten each
+        # slot for nested [['path']] shapes. Skip rows with multiple top-level list elements.
+        raw_in = row.get(orig_col)
+        raw_out = row.get(edit_col)
+        inputs = list(raw_in) if isinstance(raw_in, (list, tuple)) else ([] if raw_in is None else [raw_in])
+        outputs = list(raw_out) if isinstance(raw_out, (list, tuple)) else ([] if raw_out is None else [raw_out])
+        if len(inputs) == 1 and len(outputs) == 1:
+            ins = flatten_path_strings(inputs[0])
+            outs = flatten_path_strings(outputs[0])
+            if len(ins) == 1 and len(outs) == 1:
+                prompt = str(row.get(text_col) or "").strip()
+                yield ins[0], outs[0], prompt
         return
 
     # path string mode: one path per column ( rare for ImgEdit HF)

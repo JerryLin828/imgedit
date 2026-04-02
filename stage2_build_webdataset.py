@@ -22,6 +22,7 @@ from huggingface_hub import snapshot_download
 
 from imgedit_lib import (
     add_tar_bytes,
+    apply_image_subdir,
     detect_field_mapping,
     encode_jpeg,
     iter_imgedit_pairs_from_row,
@@ -89,6 +90,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated parquet basenames to process only, e.g. remove_part0.parquet,remove_part1.parquet",
     )
+    p.add_argument(
+        "--image-subdir",
+        default="",
+        help=(
+            "Prepend this subdirectory to bare image filenames (no directory component) before path resolution. "
+            "E.g. Singleturn/part1 for action_part* chunks."
+        ),
+    )
     return p.parse_args()
 
 
@@ -139,6 +148,7 @@ def audit_parquet_resolution(
     *,
     batch_size: int = 2048,
     max_examples: int = 8,
+    image_subdir: str = "",
 ) -> Dict[str, Any]:
     """
     Check that strict (single in / single out) paths in the parquet resolve to real files
@@ -172,9 +182,11 @@ def audit_parquet_resolution(
                 row, mode=mode, orig_col=orig_c or "", edit_col=edit_c or "", text_col=text_c
             ):
                 stats["strict_pairs"] += 1
+                inp_res = apply_image_subdir(inp_rel, image_subdir)
+                out_res = apply_image_subdir(out_rel, image_subdir)
                 in_ok = bool(
                     resolve_dataset_image_path(
-                        inp_rel,
+                        inp_res,
                         dataset_root=dataset_root,
                         parquet_path=parquet_path,
                         subst_rules=subst_rules,
@@ -182,7 +194,7 @@ def audit_parquet_resolution(
                 )
                 out_ok = bool(
                     resolve_dataset_image_path(
-                        out_rel,
+                        out_res,
                         dataset_root=dataset_root,
                         parquet_path=parquet_path,
                         subst_rules=subst_rules,
@@ -193,11 +205,11 @@ def audit_parquet_resolution(
                 else:
                     stats["broken_pairs"] += 1
                     if not in_ok and not out_ok:
-                        note_broken(inp_rel, out_rel, "missing_both")
+                        note_broken(inp_res, out_res, "missing_both")
                     elif not in_ok:
-                        note_broken(inp_rel, out_rel, "missing_input")
+                        note_broken(inp_res, out_res, "missing_input")
                     else:
-                        note_broken(inp_rel, out_rel, "missing_output")
+                        note_broken(inp_res, out_res, "missing_output")
 
     sp = stats["strict_pairs"]
     if sp:
@@ -223,6 +235,7 @@ def run_build(
     report_path: Path,
     shard_prefix: str = "",
     parquets_filter: Optional[Set[str]] = None,
+    image_subdir: str = "",
 ) -> Dict[str, Any]:
     """Core build loop; returns summary dict."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -304,15 +317,17 @@ def run_build(
                     row, mode=mode, orig_col=orig_c or "", edit_col=edit_c or "", text_col=text_c
                 ):
                     st["pairs_emitted"] += 1
+                    inp_res = apply_image_subdir(inp_rel, image_subdir)
+                    out_res = apply_image_subdir(out_rel, image_subdir)
                     if not (
                         resolve_dataset_image_path(
-                            inp_rel,
+                            inp_res,
                             dataset_root=dataset_root,
                             parquet_path=pq_path,
                             subst_rules=subst_rules,
                         )
                         and resolve_dataset_image_path(
-                            out_rel,
+                            out_res,
                             dataset_root=dataset_root,
                             parquet_path=pq_path,
                             subst_rules=subst_rules,
@@ -322,13 +337,13 @@ def run_build(
                         continue
 
                     raw_in = path_string_to_bytes(
-                        inp_rel,
+                        inp_res,
                         dataset_root=dataset_root,
                         parquet_path=pq_path,
                         subst_rules=subst_rules,
                     )
                     raw_out = path_string_to_bytes(
-                        out_rel,
+                        out_res,
                         dataset_root=dataset_root,
                         parquet_path=pq_path,
                         subst_rules=subst_rules,
@@ -363,6 +378,8 @@ def run_build(
                                 "shard_prefix": shard_prefix or None,
                                 "per_parquet": per_file_stats + [st],
                             }
+                            if (image_subdir or "").strip():
+                                summary["image_subdir"] = image_subdir.strip()
                             write_json(report_path, summary)
                             print(f"Stopped (--max-shards). Report: {report_path}")
                             return summary
@@ -382,6 +399,8 @@ def run_build(
         "subst_rules": list(subst_rules),
         "per_parquet": per_file_stats,
     }
+    if (image_subdir or "").strip():
+        summary["image_subdir"] = image_subdir.strip()
     write_json(report_path, summary)
     print(f"\nDone. Shards: {shard_idx}, samples: {total_kept}. Report: {report_path}")
     return summary
@@ -426,6 +445,7 @@ def main() -> None:
         report_path=report_path,
         shard_prefix=args.shard_prefix,
         parquets_filter=parquets_filter,
+        image_subdir=(args.image_subdir or "").strip(),
     )
 
 
