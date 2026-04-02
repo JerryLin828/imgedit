@@ -25,7 +25,9 @@ import tarfile
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Sequence, Tuple
 
-from huggingface_hub import snapshot_download
+from fnmatch import fnmatch
+
+from huggingface_hub import list_repo_files, snapshot_download
 
 from imgedit_lib import (
     HYBRID_COMPOSE_SUBST,
@@ -421,16 +423,31 @@ def main() -> None:
             sys.exit(EXIT_GENERIC_FAILURE)
         chunk.mkdir(parents=True, exist_ok=True)
         log_paths_disk_usage("pre_download", [chunk, work])
-        patterns: List[str] = [pq_rel] + list(args.allow_pattern)
-        logger.info("snapshot_download %s → %s patterns=%s", args.repo, chunk, patterns)
+
+        logger.info("Downloading parquet %s", pq_rel)
         snapshot_download(
             repo_id=args.repo,
             repo_type="dataset",
             local_dir=str(chunk),
             local_dir_use_symlinks=False,
-            allow_patterns=patterns,
+            allow_patterns=[pq_rel],
         )
-        logger.info("Download finished.")
+
+        all_files = sorted(list_repo_files(args.repo, repo_type="dataset"))
+        for pattern in args.allow_pattern:
+            matched = sorted(f for f in all_files if fnmatch(f, pattern))
+            logger.info("Pattern %s → %d file(s)", pattern, len(matched))
+            for rel in matched:
+                logger.info("Downloading %s", rel)
+                snapshot_download(
+                    repo_id=args.repo,
+                    repo_type="dataset",
+                    local_dir=str(chunk),
+                    local_dir_use_symlinks=False,
+                    allow_patterns=[rel],
+                )
+        logger.info("Download finished (%d pattern(s), repo file list size %d).",
+                     len(args.allow_pattern), len(all_files))
 
     if args.download_only:
         logger.info("Download-only stop. Re-run without --download-only to extract, audit, build, and optionally delete.")

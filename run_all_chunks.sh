@@ -11,8 +11,9 @@ set -uo pipefail
 
 BUCKET="${BUCKET:-gs://kmh-gcp-us-central1/data/imgedit}"
 ZONE="${ZONE:-us-central1}"
-LOG="${LOG:-/dev/shm/imgedit_run.log}"
-SUMMARY="${SUMMARY:-/dev/shm/imgedit_summary.log}"
+SCRATCH="${SCRATCH:-/dev/shm}"
+LOG="${LOG:-${SCRATCH}/imgedit_run.log}"
+SUMMARY="${SUMMARY:-${SCRATCH}/imgedit_summary.log}"
 
 CNT_SUCCESS=0
 CNT_SKIPPED=0
@@ -44,11 +45,11 @@ run_chunk() {
   echo "========== $(date -Is) ========== ${stem}"
 
   python stage2_chunk.py \
-    --chunk-dir "/dev/shm/imgedit_chunk_${stem}" \
+    --chunk-dir "${SCRATCH}/imgedit_chunk_${stem}" \
     --parquet "Parquet/${stem}.parquet" \
     "${allow[@]}" \
     "${extras[@]}" \
-    --work-dir "/dev/shm/imgedit_wds_${stem}" \
+    --work-dir "${SCRATCH}/imgedit_wds_${stem}" \
     --bucket "${BUCKET}/${stem}" \
     --expected-zone "${ZONE}" \
     --shard-prefix "" \
@@ -58,9 +59,9 @@ run_chunk() {
     --delete-chunk-on-failure \
     || code=$?
 
-  # Safety net: always free /dev/shm slice dirs (Python also cleans chunk on success/skip when flags set).
-  rm -rf "/dev/shm/imgedit_chunk_${stem}"
-  rm -rf "/dev/shm/imgedit_wds_${stem}"
+  # Safety net: always free scratch dirs (Python also cleans chunk on success/skip when flags set).
+  rm -rf "${SCRATCH}/imgedit_chunk_${stem}"
+  rm -rf "${SCRATCH}/imgedit_wds_${stem}"
 
   local dest="${BUCKET}/${stem}"
   if [[ "${code}" -eq 0 ]]; then
