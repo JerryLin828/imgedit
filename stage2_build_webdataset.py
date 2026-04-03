@@ -273,6 +273,9 @@ def run_build(
             shard_idx += 1
             return
 
+        # Recreate if missing (shared VM: tmpfs cleaner, stray rm -rf, or race with another job).
+        work_dir.mkdir(parents=True, exist_ok=True)
+
         with tarfile.open(tar_path, "w") as tf:
             for key, j1, j2, txt in buffer:
                 add_tar_bytes(tf, f"{key}.jpg", j1)
