@@ -14,6 +14,7 @@ ZONE="${ZONE:-us-central1}"
 SCRATCH="${SCRATCH:-/dev/shm}"
 LOG="${LOG:-${SCRATCH}/imgedit_run.log}"
 SUMMARY="${SUMMARY:-${SCRATCH}/imgedit_summary.log}"
+MAX_KILL_RETRIES="${MAX_KILL_RETRIES:-3}"
 
 CNT_SUCCESS=0
 CNT_SKIPPED=0
@@ -45,26 +46,39 @@ run_chunk() {
   done
 
   local code=0
+  local attempt=0
   echo ""
   echo "========== $(date -Is) ========== ${stem}"
 
-  python stage2_chunk.py \
-    --chunk-dir "${SCRATCH}/imgedit_chunk_${stem}" \
-    --parquet "Parquet/${stem}.parquet" \
-    "${allow[@]}" \
-    "${extras[@]}" \
-    --work-dir "${SCRATCH}/imgedit_wds_${stem}" \
-    --bucket "${BUCKET}/${stem}" \
-    --expected-zone "${ZONE}" \
-    --shard-prefix "" \
-    --min-resolve-rate 1.00 \
-    --skip-existing \
-    --delete-chunk-after \
-    --delete-chunk-on-failure \
-    --direct-download \
-    || code=$?
+  while true; do
+    attempt=$((attempt + 1))
+    code=0
 
-  # Safety net: always free scratch dirs (Python also cleans chunk on success/skip when flags set).
+    python stage2_chunk.py \
+      --chunk-dir "${SCRATCH}/imgedit_chunk_${stem}" \
+      --parquet "Parquet/${stem}.parquet" \
+      "${allow[@]}" \
+      "${extras[@]}" \
+      --work-dir "${SCRATCH}/imgedit_wds_${stem}" \
+      --bucket "${BUCKET}/${stem}" \
+      --expected-zone "${ZONE}" \
+      --shard-prefix "" \
+      --min-resolve-rate 1.00 \
+      --skip-existing \
+      --delete-chunk-after \
+      --delete-chunk-on-failure \
+      --direct-download \
+      || code=$?
+
+    if [[ "${code}" -eq 137 && "${attempt}" -lt "${MAX_KILL_RETRIES}" ]]; then
+      echo "KILLED: ${stem} (attempt ${attempt}/${MAX_KILL_RETRIES}, exit 137) — retrying in 30s (chunk dir preserved for resume)…"
+      sleep 30
+      continue
+    fi
+    break
+  done
+
+  # Clean up scratch dirs (only after final outcome; preserves .part files across 137 retries above).
   rm -rf "${SCRATCH}/imgedit_chunk_${stem}"
   rm -rf "${SCRATCH}/imgedit_wds_${stem}"
 
@@ -76,7 +90,7 @@ run_chunk() {
     echo "SKIPPED: ${stem} → audit_below_threshold_or_zero_samples_or_unknown_schema (exit ${code})" | tee -a "${SUMMARY}"
     CNT_SKIPPED=$((CNT_SKIPPED + 1))
   else
-    echo "FAILED: ${stem} → exit_code=${code} (unexpected or build error)" | tee -a "${SUMMARY}"
+    echo "FAILED: ${stem} → exit_code=${code} attempt=${attempt} (unexpected or build error)" | tee -a "${SUMMARY}"
     CNT_FAILED=$((CNT_FAILED + 1))
   fi
 }

@@ -60,9 +60,10 @@ _MERGE_READ_BUFSIZE = 4 * 1024 * 1024
 
 # Direct HTTP download defaults (mirrors deepfusion/dataset/upload_mario10m.py style).
 _DL_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MiB per iter_content chunk
-_DL_TIMEOUT = 300.0
+_DL_TIMEOUT = (30.0, 300.0)       # (connect, read) — generous read timeout for slow CDN segments
 _DL_RETRIES = 5
 _DL_BACKOFF = 1.0
+_DL_MAX_RESUME_ATTEMPTS = 20      # per-file cap for resume loops (large files over flaky links)
 
 
 def _make_download_session() -> requests.Session:
@@ -86,30 +87,36 @@ def _direct_download_file(
     token: Optional[str],
     session: requests.Session,
     chunk_size: int = _DL_CHUNK_SIZE,
-    timeout: float = _DL_TIMEOUT,
-    max_attempts: int = 3,
+    timeout: object = _DL_TIMEOUT,
+    max_attempts: int = _DL_MAX_RESUME_ATTEMPTS,
 ) -> Path:
     """
     Stream one file from HF via resolved CDN URL (bypasses XET/snapshot_download overhead).
 
     Writes to ``.part`` temp, atomic-renames on success. Skips if dest already exists with
     matching ``Content-Length``.
+
+    **Resume support**: on connection failure the ``.part`` file is kept and the next attempt
+    sends an HTTP ``Range`` header to continue from the last byte written. This avoids
+    redownloading 25+ GiB when a 40 GiB transfer breaks near the end.
     """
     dest = local_dir / repo_path
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     url = hf_hub_url(repo_id=repo_id, filename=repo_path, repo_type="dataset")
-    headers: Dict[str, str] = {}
+    auth_headers: Dict[str, str] = {}
     if token:
-        headers["authorization"] = f"Bearer {token}"
+        auth_headers["authorization"] = f"Bearer {token}"
 
     expected: Optional[int] = None
+    accepts_range = False
     try:
-        head = session.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        head = session.head(url, headers=auth_headers, timeout=timeout, allow_redirects=True)
         head.raise_for_status()
         cl = head.headers.get("Content-Length")
         if cl is not None:
             expected = int(cl)
+        accepts_range = "bytes" in (head.headers.get("Accept-Ranges") or "")
     except Exception:
         pass
 
@@ -122,45 +129,80 @@ def _direct_download_file(
         dest.unlink()
 
     part = dest.with_suffix(dest.suffix + ".part")
+    t0 = time.monotonic()
 
     for attempt in range(1, max_attempts + 1):
+        resume_from = 0
         if part.exists():
-            part.unlink()
-        written = 0
-        t0 = time.monotonic()
+            resume_from = part.stat().st_size
+            if expected is not None and resume_from >= expected:
+                break
+            if resume_from > 0 and not accepts_range:
+                logger.info("Server does not advertise Accept-Ranges; restarting %s from 0.", repo_path)
+                part.unlink()
+                resume_from = 0
+
+        req_headers = dict(auth_headers)
+        open_mode = "wb"
+        if resume_from > 0:
+            req_headers["Range"] = f"bytes={resume_from}-"
+            open_mode = "ab"
+            logger.info("Resuming %s from byte %d (attempt %d/%d)",
+                        repo_path, resume_from, attempt, max_attempts)
+
         try:
-            with session.get(url, stream=True, headers=headers, timeout=timeout) as resp:
-                resp.raise_for_status()
-                with open(part, "wb") as fp:
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
-                        if chunk:
-                            fp.write(chunk)
-                            written += len(chunk)
+            with session.get(url, stream=True, headers=req_headers, timeout=timeout) as resp:
+                if resume_from > 0 and resp.status_code == 200:
+                    logger.info("Server ignored Range header; restarting %s from 0.", repo_path)
+                    resume_from = 0
+                    open_mode = "wb"
+                elif resume_from > 0:
+                    resp.raise_for_status()
+                else:
+                    resp.raise_for_status()
+
+                written_this_round = 0
+                with open(part, open_mode) as fp:
+                    for data in resp.iter_content(chunk_size=chunk_size):
+                        if data:
+                            fp.write(data)
+                            written_this_round += len(data)
         except Exception as exc:
-            if part.exists():
-                part.unlink(missing_ok=True)
+            total_on_disk = part.stat().st_size if part.exists() else 0
             if attempt == max_attempts:
                 raise
-            logger.warning("Download error %s (attempt %d/%d): %s; retrying…",
-                           repo_path, attempt, max_attempts, exc)
-            time.sleep(_DL_BACKOFF * attempt)
+            backoff = min(_DL_BACKOFF * (2 ** (attempt - 1)), 60)
+            logger.warning(
+                "Download error %s (attempt %d/%d, %.1f MiB on disk): %s; resuming in %.0fs…",
+                repo_path, attempt, max_attempts,
+                total_on_disk / (1024**2), exc, backoff,
+            )
+            time.sleep(backoff)
             continue
 
-        if expected is not None and written != expected:
-            if part.exists():
-                part.unlink(missing_ok=True)
+        total_written = part.stat().st_size if part.exists() else 0
+        if expected is not None and total_written != expected:
             if attempt == max_attempts:
                 raise IOError(
-                    f"Size mismatch for {repo_path}: expected {expected}, got {written}"
+                    f"Size mismatch for {repo_path}: expected {expected}, got {total_written}"
                 )
-            logger.warning("Size mismatch %s (%d vs %d, attempt %d/%d); retrying…",
-                           repo_path, written, expected, attempt, max_attempts)
+            backoff = min(_DL_BACKOFF * (2 ** (attempt - 1)), 60)
+            logger.warning("Size mismatch %s (%d vs %d, attempt %d/%d); resuming in %.0fs…",
+                           repo_path, total_written, expected, attempt, max_attempts, backoff)
+            time.sleep(backoff)
             continue
 
+        break
+
+    if part.exists():
+        final_size = part.stat().st_size
+        if expected is not None and final_size != expected:
+            part.unlink(missing_ok=True)
+            raise IOError(f"Final size mismatch for {repo_path}: expected {expected}, got {final_size}")
         shutil.move(str(part), str(dest))
         elapsed = time.monotonic() - t0
-        speed = (written / (1024**2)) / max(elapsed, 0.01)
-        logger.info("Downloaded %s (%.2f MiB, %.1f MiB/s)", repo_path, written / (1024**2), speed)
+        speed = (final_size / (1024**2)) / max(elapsed, 0.01)
+        logger.info("Downloaded %s (%.2f MiB, %.1f MiB/s)", repo_path, final_size / (1024**2), speed)
         return dest
 
     raise RuntimeError(f"Failed to download {repo_path} after {max_attempts} attempts")
