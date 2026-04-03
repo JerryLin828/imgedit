@@ -18,7 +18,9 @@ import logging
 import shutil
 import subprocess
 import tarfile
+import unicodedata
 from collections import defaultdict
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -60,6 +62,133 @@ TEXT_CANDIDATES: List[str] = [COL_PROMPT, "instruction", "caption", "text", "edi
 # stage1_explore logs these as roots_missing_in_hub_filenames for hybrid_part*.parquet) while Hub ships
 # results_hybrid* archives/trees. apply_rel_substitutions replaces the first occurrence of OLD in each path.
 HYBRID_COMPOSE_SUBST: Tuple[str, str] = ("results_compose", "results_hybrid")
+
+_TURN_ROOT_PREFIXES: Tuple[str, ...] = (
+    "Singleturn/",
+    "Multiturn/",
+    "singleturn/",
+    "multiturn/",
+    "SINGLETURN/",
+    "MULTITURN/",
+)
+
+
+def normalize_hub_relpath(s: str) -> str:
+    """
+    Normalize repo-relative paths from Hugging Face parquet cells / filenames for matching.
+
+    NFC unicode, forward slashes, strip whitespace, drop redundant ``./`` and ``//``.
+    """
+    t = unicodedata.normalize("NFC", str(s).strip().replace("\\", "/"))
+    while "//" in t:
+        t = t.replace("//", "/")
+    t = t.lstrip("/").lstrip("./")
+    return t
+
+
+def match_repo_paths(all_files: Sequence[str], pattern: str) -> List[str]:
+    """
+    Match Hugging Face ``list_repo_files`` paths against a shell-style glob.
+
+    Uses normalized slashes / unicode first; if nothing matches, tries case-folding (some
+    mirrors or older snapshots differ only by case); finally tries the raw pattern as given.
+    """
+    pat_norm = normalize_hub_relpath(pattern)
+
+    def norm_key(path: str) -> str:
+        return normalize_hub_relpath(path)
+
+    out = sorted({f for f in all_files if fnmatch(norm_key(f), pat_norm)})
+    if out:
+        return out
+
+    pat_cf = pat_norm.casefold()
+    out = sorted({f for f in all_files if fnmatch(norm_key(f).casefold(), pat_cf)})
+    if out:
+        return out
+
+    return sorted({f for f in all_files if fnmatch(f, pattern)})
+
+
+def _parquet_rel_variants(raw: str) -> List[str]:
+    """Deduped parquet path strings to try when resolving on disk (HF vs tar layout drift)."""
+    n = normalize_hub_relpath(raw)
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def add(x: str) -> None:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+
+    add(n)
+    add(raw.strip())
+    cur = n
+    for _ in range(4):
+        stripped = False
+        for pref in _TURN_ROOT_PREFIXES:
+            pl, cl = pref.lower(), cur.lower()
+            if cl.startswith(pl):
+                cur = cur[len(pref) :].lstrip("/")
+                add(cur)
+                stripped = True
+                break
+        if not stripped or not cur:
+            break
+    return out
+
+
+def _same_file_casefold(path: Path) -> Optional[Path]:
+    """If ``path`` is missing, look for a same-parent file whose name matches case-insensitively."""
+    if path.is_file():
+        return path
+    parent = path.parent
+    if not parent.is_dir():
+        return None
+    want = path.name.casefold()
+    try:
+        for child in parent.iterdir():
+            if child.is_file() and child.name.casefold() == want:
+                return child
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_under_any_results_task(
+    dataset_root: Path, rel: Path, *, max_tasks: int = 4096
+) -> Optional[Path]:
+    """
+    Last resort: parquet may name ``results_foo/part/file`` but Hub tar used a sibling
+    ``results_bar``. Match on unique ``basename(parent)/filename`` under ``Singleturn/results_*``.
+    """
+    if len(rel.parts) < 2:
+        return None
+    parent_name, fname = rel.parts[-2], rel.parts[-1]
+    single = dataset_root / "Singleturn"
+    if not single.is_dir():
+        return None
+    hits: List[Path] = []
+    try:
+        scanned = 0
+        for task in single.iterdir():
+            if scanned >= max_tasks:
+                break
+            scanned += 1
+            if not task.is_dir() or not task.name.startswith("results_"):
+                continue
+            c = task / parent_name / fname
+            if c.is_file():
+                hits.append(c)
+            else:
+                alt = _same_file_casefold(c)
+                if alt is not None:
+                    hits.append(alt)
+    except OSError:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def apply_rel_substitutions(rel: str, rules: Sequence[Tuple[str, str]]) -> str:
@@ -158,27 +287,39 @@ def resolve_dataset_image_path(
     Tries dataset root, Singleturn/, Multiturn/, and the parquet file's directory
     (useful when Parquet/ lives next to extracted image trees).
 
+    Also tries normalized / stripped ``Singleturn/`` prefixes from HF strings, case-insensitive
+    filenames in the same parent directory, and a narrow scan under ``Singleturn/results_*``
+    when the top-level ``results_*`` folder name in the parquet does not match the extracted tar.
+
     Absolute POSIX paths are used as-is if the file exists.
     """
     if path_str is None:
         return None
-    s = apply_rel_substitutions(str(path_str).strip(), subst_rules)
-    if not s or s.lower() in ("none", "null"):
+    s0 = apply_rel_substitutions(str(path_str).strip(), subst_rules)
+    if not s0 or s0.lower() in ("none", "null"):
         return None
 
-    p = Path(s)
-    if p.is_absolute():
-        return p if p.is_file() else None
+    p0 = Path(s0)
+    if p0.is_absolute():
+        hit = p0 if p0.is_file() else _same_file_casefold(p0)
+        return hit
 
-    candidates = [
-        dataset_root / p,
-        dataset_root / "Singleturn" / p,
-        dataset_root / "Multiturn" / p,
-        parquet_path.parent / p,
-        (dataset_root / s.lstrip("./")),
-        (dataset_root / "Singleturn" / s.lstrip("./")),
-        (dataset_root / "Multiturn" / s.lstrip("./")),
-    ]
+    variants = _parquet_rel_variants(s0)
+    candidates: List[Path] = []
+    for s in variants:
+        p = Path(s)
+        candidates.extend(
+            [
+                dataset_root / p,
+                dataset_root / "Singleturn" / p,
+                dataset_root / "Multiturn" / p,
+                parquet_path.parent / p,
+                dataset_root / s.lstrip("./"),
+                dataset_root / "Singleturn" / s.lstrip("./"),
+                dataset_root / "Multiturn" / s.lstrip("./"),
+            ]
+        )
+
     seen: Set[Path] = set()
     for c in candidates:
         try:
@@ -190,6 +331,22 @@ def resolve_dataset_image_path(
         seen.add(r)
         if r.is_file():
             return r
+        alt = _same_file_casefold(r)
+        if alt is not None:
+            try:
+                ar = alt.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if ar not in seen:
+                seen.add(ar)
+                return ar
+
+    for s in variants:
+        tail = Path(s)
+        if len(tail.parts) >= 2:
+            hit = _resolve_under_any_results_task(dataset_root, tail)
+            if hit is not None:
+                return hit
     return None
 
 

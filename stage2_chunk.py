@@ -24,7 +24,6 @@ import shutil
 import sys
 import tarfile
 import time
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Sequence, Tuple
 
@@ -36,6 +35,7 @@ from urllib3.util.retry import Retry
 from imgedit_lib import (
     HYBRID_COMPOSE_SUBST,
     log_paths_disk_usage,
+    match_repo_paths,
     warn_bucket_zone,
     write_json,
 )
@@ -128,7 +128,8 @@ def _direct_download_file(
                      repo_path, dest.stat().st_size, expected)
         dest.unlink()
 
-    part = dest.with_suffix(dest.suffix + ".part")
+    # Append ".part" to the full basename (not Path.with_suffix: breaks names like file.tar.split.000).
+    part = dest.parent / (dest.name + ".part")
     t0 = time.monotonic()
 
     for attempt in range(1, max_attempts + 1):
@@ -151,6 +152,8 @@ def _direct_download_file(
                         repo_path, resume_from, attempt, max_attempts)
 
         try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
             with session.get(url, stream=True, headers=req_headers, timeout=timeout) as resp:
                 if resume_from > 0 and resp.status_code == 200:
                     logger.info("Server ignored Range header; restarting %s from 0.", repo_path)
@@ -167,6 +170,11 @@ def _direct_download_file(
                         if data:
                             fp.write(data)
                             written_this_round += len(data)
+                    fp.flush()
+                    try:
+                        os.fsync(fp.fileno())
+                    except (OSError, AttributeError):
+                        pass
         except Exception as exc:
             total_on_disk = part.stat().st_size if part.exists() else 0
             if attempt == max_attempts:
@@ -194,18 +202,28 @@ def _direct_download_file(
 
         break
 
-    if part.exists():
-        final_size = part.stat().st_size
-        if expected is not None and final_size != expected:
-            part.unlink(missing_ok=True)
-            raise IOError(f"Final size mismatch for {repo_path}: expected {expected}, got {final_size}")
-        shutil.move(str(part), str(dest))
-        elapsed = time.monotonic() - t0
-        speed = (final_size / (1024**2)) / max(elapsed, 0.01)
-        logger.info("Downloaded %s (%.2f MiB, %.1f MiB/s)", repo_path, final_size / (1024**2), speed)
-        return dest
+    if not part.exists():
+        raise RuntimeError(f"Download finished but partial file missing: {part} (dest={dest})")
 
-    raise RuntimeError(f"Failed to download {repo_path} after {max_attempts} attempts")
+    final_size = part.stat().st_size
+    if expected is not None and final_size != expected:
+        part.unlink(missing_ok=True)
+        raise IOError(f"Final size mismatch for {repo_path}: expected {expected}, got {final_size}")
+
+    try:
+        os.replace(part, dest)
+    except OSError as exc:
+        listing = ""
+        try:
+            listing = ", dir=" + repr(sorted(p.name for p in dest.parent.iterdir()))
+        except OSError as exc2:
+            listing = f", listdir_error={exc2}"
+        raise OSError(f"Could not rename {part} -> {dest}: {exc}{listing}") from exc
+
+    elapsed = time.monotonic() - t0
+    speed = (final_size / (1024**2)) / max(elapsed, 0.01)
+    logger.info("Downloaded %s (%.2f MiB, %.1f MiB/s)", repo_path, final_size / (1024**2), speed)
+    return dest
 
 
 class _TarSplitConcatReader:
@@ -603,7 +621,7 @@ def main() -> None:
                 logger.warning("HF_TOKEN not set; --direct-download may fail for gated datasets.")
             session = _make_download_session()
             for pattern in args.allow_pattern:
-                matched = sorted(f for f in all_files if fnmatch(f, pattern))
+                matched = match_repo_paths(all_files, pattern)
                 logger.info("Pattern %s → %d file(s) [direct HTTP]", pattern, len(matched))
                 for rel in matched:
                     _direct_download_file(
@@ -615,7 +633,7 @@ def main() -> None:
                     )
         else:
             for pattern in args.allow_pattern:
-                matched = sorted(f for f in all_files if fnmatch(f, pattern))
+                matched = match_repo_paths(all_files, pattern)
                 logger.info("Pattern %s → %d file(s)", pattern, len(matched))
                 for rel in matched:
                     logger.info("Downloading %s", rel)
